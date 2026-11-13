@@ -1,9 +1,13 @@
-from typing import Dict, List, Optional
+import json
+import re
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from open_notebook.ai.provision import provision_langchain_model
 from open_notebook.exceptions import InvalidInputError, OpenNotebookError
 from open_notebook.podcasts.models import EpisodeProfile, SpeakerProfile
 
@@ -266,3 +270,107 @@ async def duplicate_episode_profile(profile_id: str):
         raise HTTPException(
             status_code=500, detail="Failed to duplicate episode profile"
         )
+
+
+class EpisodeDesignMessage(BaseModel):
+    role: str
+    content: str
+
+
+class EpisodeDesignRequest(BaseModel):
+    messages: List[EpisodeDesignMessage]
+    finalize: bool = False
+
+
+def _extract_episode_json(text: str, allow_fallback_question: bool = True) -> Dict[str, Any]:
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
+    if fence:
+        cleaned = fence.group(1).strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(cleaned[start : end + 1])
+            except Exception:
+                pass
+        if allow_fallback_question and cleaned:
+            return {"status": "question", "reply": cleaned, "questions": None, "draft": None}
+        raise
+
+
+@router.post("/episode-profiles/design")
+async def design_episode_profile(payload: EpisodeDesignRequest):
+    """Interactive LLM assistant to design a podcast episode profile (format, briefing, segments, speaker pairing)."""
+    speaker_summaries: List[str] = []
+    try:
+        speakers = await SpeakerProfile.get_all(order_by="name asc")
+        for sp in speakers:
+            cast = ", ".join(
+                f"{s.get('name', '?')} ({s.get('voice_id', '?')})" for s in (sp.speakers or [])
+            )
+            speaker_summaries.append(f"{sp.id} | {sp.name} | {sp.description or ''} | cast: [{cast}]")
+    except Exception as exc:
+        logger.warning(f"Could not fetch speaker profiles for episode designer: {exc}")
+
+    system_prompt = (
+        "You are a creative podcast showrunner & episode format designer.\n"
+        "Your job is to help the user design an Episode Profile (show name, description, segment count, "
+        "and a rich `default_briefing` that guides the outline & transcript LLMs on tone, banter, pacing, and how hosts react to source material).\n\n"
+        "IMPORTANT RULES:\n"
+        "1. If the user's idea is brief or missing key details (and finalize=False), ask 1-3 short, focused follow-up questions using the `questions` array. "
+        "Ask about things like:\n"
+        "   - Show premise & vibe (e.g. two gangsters breaking down tech news, late-night diner roast, investigative deep dive)\n"
+        "   - How hosts treat the source material (skeptical, hype, comedic,ELI5, storytelling, rapid-fire)\n"
+        "   - Pacing, segment count (3-20), and recurring bits/catchphrases or intro/outro style\n"
+        "2. When you have enough detail (or when finalize=True), return `status: 'ready'` with `draft`.\n"
+        "3. Write `default_briefing` as a vivid, actionable director's brief for the podcast scriptwriter: "
+        "specify tone, banter rules, how to weave in the speakers' dialects/personalities, segment flow, and opening/closing style.\n"
+        "4. Pick `suggested_speaker_profile_id` as an EXACT `id` from the Available Speaker Profiles below (or null if none fit).\n\n"
+        "Available Speaker Profiles (id | name | description | cast):\n"
+        + ("\n".join(speaker_summaries) if speaker_summaries else "(none)")
+        + "\n\nRespond ONLY with valid JSON matching this exact schema:\n"
+        "{\n"
+        '  "status": "question" | "ready",\n'
+        '  "reply": "Short 1-2 sentence conversational reaction (plain text, no markdown asterisks)",\n'
+        '  "questions": null | [\n'
+        '    {"id": "q1", "label": "Short 2-4 word label", "prompt": "Clear question for the user", "placeholder": "e.g. example answer"}\n'
+        "  ],\n"
+        '  "draft": null | {\n'
+        '    "name": "Episode Profile Name",\n'
+        '    "description": "1-2 sentence summary of this episode format",\n'
+        '    "num_segments": 5,\n'
+        '    "suggested_speaker_profile_id": "exact speaker_profile id or null",\n'
+        '    "default_briefing": "Detailed showrunner briefing for outline & transcript generation"\n'
+        "  }\n"
+        "}"
+    )
+
+    try:
+        llm = await provision_langchain_model("", None, "chat", temperature=0.7, max_tokens=4096)
+    except Exception:
+        llm = await provision_langchain_model("", None, "transformation", temperature=0.7, max_tokens=4096)
+
+    lc_messages: List[Any] = [SystemMessage(content=system_prompt)]
+    for m in payload.messages:
+        if m.role == "assistant":
+            lc_messages.append(AIMessage(content=m.content))
+        else:
+            lc_messages.append(HumanMessage(content=m.content))
+    if payload.finalize:
+        lc_messages.append(
+            HumanMessage(
+                content="Please finalize now and return status='ready' with the complete draft JSON based on everything we've discussed."
+            )
+        )
+
+    try:
+        ai_resp = await llm.ainvoke(lc_messages)
+        raw_text = ai_resp.content if isinstance(ai_resp.content, str) else str(ai_resp.content)
+        return _extract_episode_json(raw_text, allow_fallback_question=not payload.finalize)
+    except Exception as exc:
+        logger.error(f"Episode designer failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Episode designer failed: {exc}")

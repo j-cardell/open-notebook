@@ -43,6 +43,7 @@ docker-compose*
 # Documentation & CI (not needed in image)
 docs
 .github
+local-audio/
 
 # IDE and OS files
 .vscode

@@ -112,6 +112,112 @@ export function useRetryPodcastEpisode() {
   })
 }
 
+export function useUpdateEpisodeTranscript() {
+  const queryClient = useQueryClient()
+  const { toast } = useToast()
+
+  return useMutation({
+    mutationFn: ({
+      episodeId,
+      transcript,
+    }: {
+      episodeId: string
+      transcript: Array<{ speaker: string; dialogue: string; speed?: number }>
+    }) => podcastsApi.updateEpisodeTranscript(episodeId, transcript),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: QUERY_KEYS.podcastEpisodes })
+      toast({
+        title: 'Transcript saved',
+        description: 'Click Rerun TTS on the episode card to regenerate the audio.',
+      })
+    },
+    onError: (error: unknown) => {
+      toast({
+        title: 'Failed to save transcript',
+        description: error instanceof Error ? error.message : 'Unable to save transcript',
+        variant: 'destructive',
+      })
+    },
+  })
+}
+
+export function useRerunEpisodeClip() {
+  const queryClient = useQueryClient()
+  const { toast } = useToast()
+
+  return useMutation({
+    mutationFn: ({
+      episodeId,
+      clipIndex,
+      payload,
+    }: {
+      episodeId: string
+      clipIndex: number
+      payload: { speaker?: string; dialogue?: string; speed?: number }
+    }) => podcastsApi.rerunEpisodeClip(episodeId, clipIndex, payload),
+    onSuccess: async (_data, variables) => {
+      await queryClient.invalidateQueries({ queryKey: QUERY_KEYS.podcastEpisodes })
+      toast({
+        title: `Block #${variables.clipIndex + 1} updated`,
+        description: 'Regenerated block audio and re-muxed the episode.',
+      })
+    },
+    onError: (error: unknown) => {
+      toast({
+        title: 'Failed to rerun block TTS',
+        description: error instanceof Error ? error.message : 'Unable to rerun block',
+        variant: 'destructive',
+      })
+    },
+  })
+}
+
+export function useRerunEpisodeTts() {
+  const queryClient = useQueryClient()
+  const { toast } = useToast()
+
+  return useMutation({
+    mutationFn: (episodeId: string) => podcastsApi.rerunEpisodeTts(episodeId),
+    onSuccess: async () => {
+      await queryClient.refetchQueries({ queryKey: QUERY_KEYS.podcastEpisodes })
+      toast({
+        title: 'TTS regeneration started',
+        description: 'The episode audio is being regenerated from the saved transcript.',
+      })
+    },
+    onError: (error: unknown) => {
+      toast({
+        title: 'Failed to rerun TTS',
+        description: error instanceof Error ? error.message : 'Unable to rerun TTS',
+        variant: 'destructive',
+      })
+    },
+  })
+}
+
+export function useCancelPodcastEpisode() {
+  const queryClient = useQueryClient()
+  const { toast } = useToast()
+
+  return useMutation({
+    mutationFn: (episodeId: string) => podcastsApi.cancelEpisode(episodeId),
+    onSuccess: async () => {
+      await queryClient.refetchQueries({ queryKey: QUERY_KEYS.podcastEpisodes })
+      toast({
+        title: 'Generation stopped',
+        description: 'The active generation job has been stopped.',
+      })
+    },
+    onError: (error: unknown) => {
+      toast({
+        title: 'Failed to stop generation',
+        description: error instanceof Error ? error.message : 'Unable to stop generation',
+        variant: 'destructive',
+      })
+    },
+  })
+}
+
 export function useDeletePodcastEpisode() {
   const queryClient = useQueryClient()
   const { toast } = useToast()

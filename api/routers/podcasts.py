@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from loguru import logger
 from pydantic import BaseModel
+from surreal_commands import submit_command
 
 from api.podcast_service import (
     PodcastGenerationRequest,
@@ -11,6 +12,7 @@ from api.podcast_service import (
     PodcastService,
 )
 from open_notebook.ai.models import Model
+from open_notebook.database.repository import ensure_record_id, repo_query
 from open_notebook.exceptions import OpenNotebookError
 from open_notebook.podcasts.audio_paths import resolve_contained_audio_path
 from open_notebook.podcasts.models import PodcastEpisode
@@ -395,6 +397,228 @@ async def retry_podcast_episode(episode_id: str):
     except Exception as e:
         logger.error(f"Error retrying podcast episode: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to retry episode")
+
+
+class TranscriptEntryPayload(BaseModel):
+    speaker: str
+    dialogue: str
+    speed: Optional[float] = None
+
+
+class UpdateTranscriptRequest(BaseModel):
+    transcript: List[TranscriptEntryPayload]
+
+
+class RerunClipRequest(BaseModel):
+    speaker: Optional[str] = None
+    dialogue: Optional[str] = None
+    speed: Optional[float] = None
+
+
+@router.patch("/podcasts/episodes/{episode_id}/transcript")
+async def update_podcast_episode_transcript(
+    episode_id: str,
+    payload: UpdateTranscriptRequest,
+):
+    """Save edits to an episode's transcript."""
+    try:
+        episode = await PodcastService.get_episode(episode_id)
+        cleaned = []
+        for entry in payload.transcript:
+            if entry.speaker.strip() and entry.dialogue.strip():
+                item: dict = {"speaker": entry.speaker.strip(), "dialogue": entry.dialogue.strip()}
+                if entry.speed is not None:
+                    item["speed"] = round(max(0.5, min(2.0, float(entry.speed))), 2)
+                cleaned.append(item)
+        if not cleaned:
+            raise HTTPException(
+                status_code=400,
+                detail="Transcript must contain at least one non-empty line",
+            )
+        episode.transcript = {"transcript": cleaned}
+        await episode.save()
+        return {"episode_id": str(episode.id), "transcript": episode.transcript}
+    except HTTPException:
+        raise
+    except OpenNotebookError:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating episode transcript: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update transcript")
+
+
+@router.post("/podcasts/episodes/{episode_id}/rerun-tts")
+async def rerun_podcast_episode_tts(episode_id: str):
+    """Regenerate episode audio from its saved transcript."""
+    try:
+        episode = await PodcastService.get_episode(episode_id)
+        entries = (episode.transcript or {}).get("transcript") or []
+        if not entries:
+            raise HTTPException(
+                status_code=400,
+                detail="Episode has no transcript to synthesize",
+            )
+        import commands.podcast_commands  # noqa: F401
+
+        job_id = submit_command(
+            "open_notebook",
+            "rerun_podcast_tts",
+            {"episode_id": str(episode.id)},
+        )
+        if not job_id:
+            raise HTTPException(status_code=500, detail="Failed to submit TTS rerun job")
+        episode.command = ensure_record_id(str(job_id))
+        await episode.save()
+        return {
+            "job_id": str(job_id),
+            "status": "submitted",
+            "message": "TTS regeneration started",
+        }
+    except HTTPException:
+        raise
+    except OpenNotebookError:
+        raise
+    except Exception as e:
+        logger.error(f"Error rerunning episode TTS: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to rerun TTS")
+
+
+@router.get("/podcasts/episodes/{episode_id}/clips/{clip_index}")
+async def stream_podcast_episode_clip(episode_id: str, clip_index: int):
+    """Stream an individual dialogue clip MP3 for an episode."""
+    if clip_index < 0:
+        raise HTTPException(status_code=400, detail="Invalid clip index")
+    episode = await PodcastService.get_episode(episode_id)
+    if not episode.audio_file:
+        raise HTTPException(status_code=404, detail="Episode has no audio directory")
+    audio_path = resolve_contained_audio_path(episode.audio_file)
+    if audio_path is None:
+        raise HTTPException(status_code=403, detail="Access to file denied")
+    clip_path = audio_path.parent.parent / "clips" / f"{clip_index:04d}.mp3"
+    if not clip_path.exists():
+        raise HTTPException(status_code=404, detail="Clip file not found")
+    return FileResponse(
+        clip_path,
+        media_type="audio/mpeg",
+        filename=clip_path.name,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/podcasts/episodes/{episode_id}/clips/{clip_index}/rerun")
+async def rerun_podcast_episode_clip(
+    episode_id: str,
+    clip_index: int,
+    payload: RerunClipRequest,
+):
+    """Regenerate a single transcript block's TTS clip and re-mux the episode MP3."""
+    try:
+        from esperanto import AIFactory
+        from podcast_creator.core import combine_audio_files
+        from open_notebook.podcasts.models import _resolve_model_config
+
+        episode = await PodcastService.get_episode(episode_id)
+        entries = list((episode.transcript or {}).get("transcript") or [])
+        if clip_index < 0 or clip_index >= len(entries):
+            raise HTTPException(status_code=404, detail="Transcript block not found")
+        if not episode.audio_file:
+            raise HTTPException(status_code=400, detail="Episode has no audio file to re-mux")
+
+        audio_path = resolve_contained_audio_path(episode.audio_file)
+        if audio_path is None:
+            raise HTTPException(status_code=403, detail="Access to file denied")
+
+        audio_dir = audio_path.parent
+        clips_dir = audio_dir.parent / "clips"
+        clips_dir.mkdir(parents=True, exist_ok=True)
+        clip_path = clips_dir / f"{clip_index:04d}.mp3"
+
+        entry = dict(entries[clip_index])
+        if payload.speaker is not None and payload.speaker.strip():
+            entry["speaker"] = payload.speaker.strip()
+        if payload.dialogue is not None and payload.dialogue.strip():
+            entry["dialogue"] = payload.dialogue.strip()
+        if payload.speed is not None:
+            entry["speed"] = round(max(0.5, min(2.0, float(payload.speed))), 2)
+        entries[clip_index] = entry
+        episode.transcript = {"transcript": entries}
+        await episode.save()
+
+        sp_dict = dict(episode.speaker_profile or {})
+        tts_provider = sp_dict.get("tts_provider")
+        tts_model_name = sp_dict.get("tts_model")
+        tts_config = dict(sp_dict.get("tts_config") or {})
+        if sp_dict.get("voice_model"):
+            tts_provider, tts_model_name, tts_config = await _resolve_model_config(
+                str(sp_dict["voice_model"])
+            )
+
+        voice_id = None
+        for sp in sp_dict.get("speakers", []):
+            if sp.get("name") == entry["speaker"]:
+                voice_id = sp.get("voice_id")
+                if sp.get("voice_model"):
+                    tts_provider, tts_model_name, tts_config = await _resolve_model_config(
+                        str(sp["voice_model"])
+                    )
+                break
+        if not voice_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Speaker '{entry['speaker']}' not found in episode speaker profile",
+            )
+
+        cfg = dict(tts_config or {})
+        api_key = cfg.pop("api_key", None)
+        base_url = cfg.pop("base_url", None)
+        tts_model = AIFactory.create_text_to_speech(
+            tts_provider, tts_model_name, api_key=api_key, base_url=base_url, **cfg
+        )
+
+        speech_kwargs: dict = {}
+        if entry.get("speed") is not None:
+            speech_kwargs["speed"] = float(entry["speed"])
+        await tts_model.agenerate_speech(
+            text=entry["dialogue"],
+            voice=voice_id,
+            output_file=clip_path,
+            **speech_kwargs,
+        )
+
+        await combine_audio_files(clips_dir, audio_path.name, audio_dir)
+        return {
+            "episode_id": str(episode.id),
+            "clip_index": clip_index,
+            "entry": entry,
+        }
+    except HTTPException:
+        raise
+    except OpenNotebookError:
+        raise
+    except Exception as e:
+        logger.error(f"Error rerunning clip {clip_index} for {episode_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to rerun block TTS: {e}")
+
+
+@router.post("/podcasts/episodes/{episode_id}/cancel")
+async def cancel_podcast_episode(episode_id: str):
+    """Stop an in-progress podcast generation or TTS rerun job."""
+    try:
+        episode = await PodcastService.get_episode(episode_id)
+        if not episode.command:
+            return {"episode_id": str(episode.id), "cancelled": False}
+        await repo_query(
+            "UPDATE $cmd SET status = 'failed', error_message = 'Stopped by user'",
+            {"cmd": ensure_record_id(episode.command)},
+        )
+        return {"episode_id": str(episode.id), "cancelled": True}
+    except HTTPException:
+        raise
+    except OpenNotebookError:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling episode job: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to stop generation")
 
 
 @router.delete("/podcasts/episodes/{episode_id}")

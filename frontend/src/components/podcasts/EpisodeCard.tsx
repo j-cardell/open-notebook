@@ -3,11 +3,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { formatDistanceToNow } from 'date-fns'
 import { getDateLocale } from '@/lib/utils/date-locale'
-import { InfoIcon, RefreshCcw, Trash2 } from 'lucide-react'
+import { Check, InfoIcon, Loader2, Pencil, Play, Plus, RefreshCcw, Square, Trash2, Volume2, X } from 'lucide-react'
 
 import apiClient from '@/lib/api/client'
 import { resolvePodcastAssetUrl } from '@/lib/api/podcasts'
-import { EpisodeStatus, FAILED_EPISODE_STATUSES, PodcastEpisode } from '@/lib/types/podcasts'
+import { useCancelPodcastEpisode, useRerunEpisodeClip, useRerunEpisodeTts, useUpdateEpisodeTranscript } from '@/lib/hooks/use-podcasts'
+import { ACTIVE_EPISODE_STATUSES, EpisodeStatus, FAILED_EPISODE_STATUSES, PodcastEpisode } from '@/lib/types/podcasts'
 import { cn } from '@/lib/utils'
 import {
   AlertDialog,
@@ -33,6 +34,7 @@ import {
 } from '@/components/ui/dialog'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Textarea } from '@/components/ui/textarea'
 import { useTranslation } from '@/lib/hooks/use-translation'
 import type { TFunction } from 'i18next'
 
@@ -113,6 +115,7 @@ type OutlineData = {
 type TranscriptEntry = {
   speaker?: string
   dialogue?: string
+  speed?: number
 }
 
 type TranscriptData = {
@@ -158,9 +161,98 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
   const [audioSrc, setAudioSrc] = useState<string | undefined>()
   const [audioError, setAudioError] = useState<string | null>(null)
   const [detailsOpen, setDetailsOpen] = useState(false)
+  const [editingTranscript, setEditingTranscript] = useState(false)
+  const [draftTranscript, setDraftTranscript] = useState<Array<{ speaker: string; dialogue: string; speed?: number }>>([])
+  const [clipUrls, setClipUrls] = useState<Record<number, string>>({})
+  const [loadingClipIndex, setLoadingClipIndex] = useState<number | null>(null)
+  const [rerunningClipIndex, setRerunningClipIndex] = useState<number | null>(null)
+  const [blockSpeeds, setBlockSpeeds] = useState<Record<number, number | undefined>>({})
+  const [audioNonce, setAudioNonce] = useState(0)
+
+  const updateTranscript = useUpdateEpisodeTranscript()
+  const rerunTts = useRerunEpisodeTts()
+  const rerunClip = useRerunEpisodeClip()
+  const cancelEpisode = useCancelPodcastEpisode()
 
   const outlineSegments = useMemo(() => extractOutlineSegments(episode.outline), [episode.outline])
   const transcriptEntries = useMemo(() => extractTranscriptEntries(episode.transcript), [episode.transcript])
+
+  const speakerNames = useMemo(() => {
+    const names = (episode.speaker_profile?.speakers ?? []).map((s) => s.name).filter(Boolean)
+    return Array.from(new Set(names))
+  }, [episode.speaker_profile?.speakers])
+
+  const startEditTranscript = () => {
+    setDraftTranscript(
+      transcriptEntries.map((entry, idx) => ({
+        speaker: entry.speaker ?? speakerNames[0] ?? '',
+        dialogue: entry.dialogue ?? '',
+        speed: blockSpeeds[idx] ?? entry.speed,
+      }))
+    )
+    setEditingTranscript(true)
+  }
+
+  const cancelEditTranscript = () => {
+    setEditingTranscript(false)
+    setDraftTranscript([])
+  }
+
+  const saveEditTranscript = async () => {
+    const cleaned = draftTranscript
+      .map((e) => ({
+        speaker: e.speaker.trim(),
+        dialogue: e.dialogue.trim(),
+        ...(e.speed !== undefined ? { speed: e.speed } : {}),
+      }))
+      .filter((e) => e.speaker && e.dialogue)
+    if (cleaned.length === 0) return
+    await updateTranscript.mutateAsync({ episodeId: episode.id, transcript: cleaned })
+    setEditingTranscript(false)
+  }
+
+  const handlePreviewClip = async (idx: number) => {
+    setLoadingClipIndex(idx)
+    try {
+      const clipApiUrl = await resolvePodcastAssetUrl(
+        `/api/podcasts/episodes/${episode.id}/clips/${idx}?v=${Date.now()}`
+      )
+      if (!clipApiUrl) return
+      const response = await apiClient.get<Blob>(clipApiUrl, { responseType: 'blob' })
+      const nextUrl = URL.createObjectURL(response.data)
+      setClipUrls((prev) => {
+        if (prev[idx]) URL.revokeObjectURL(prev[idx])
+        return { ...prev, [idx]: nextUrl }
+      })
+    } catch (err) {
+      console.error('Unable to load clip preview', err)
+    } finally {
+      setLoadingClipIndex(null)
+    }
+  }
+
+  const handleRerunClip = async (
+    idx: number,
+    overrides?: { speaker?: string; dialogue?: string; speed?: number }
+  ) => {
+    setRerunningClipIndex(idx)
+    try {
+      const speedVal = overrides?.speed ?? blockSpeeds[idx] ?? transcriptEntries[idx]?.speed
+      await rerunClip.mutateAsync({
+        episodeId: episode.id,
+        clipIndex: idx,
+        payload: {
+          ...(overrides?.speaker ? { speaker: overrides.speaker } : {}),
+          ...(overrides?.dialogue ? { dialogue: overrides.dialogue } : {}),
+          ...(speedVal !== undefined ? { speed: speedVal } : {}),
+        },
+      })
+      setAudioNonce((n) => n + 1)
+      await handlePreviewClip(idx)
+    } finally {
+      setRerunningClipIndex(null)
+    }
+  }
 
   useEffect(() => {
     let revokeUrl: string | undefined
@@ -199,7 +291,7 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
         URL.revokeObjectURL(revokeUrl)
       }
     }
-  }, [episode.audio_url, episode.audio_file, t])
+  }, [episode.audio_url, episode.audio_file, episode.job_status, audioNonce, t])
 
   const distance = episode.created
     ? formatDistanceToNow(new Date(episode.created), {
@@ -223,6 +315,7 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
   }
 
   const isFailed = FAILED_EPISODE_STATUSES.includes(episode.job_status as EpisodeStatus)
+  const isActive = ACTIVE_EPISODE_STATUSES.includes(episode.job_status as EpisodeStatus)
 
   return (
     <Card>
@@ -241,7 +334,40 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <Dialog open={detailsOpen} onOpenChange={setDetailsOpen}>
+            {isActive ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-destructive border-destructive/40 hover:bg-destructive/10"
+                onClick={() => void cancelEpisode.mutateAsync(episode.id)}
+                disabled={cancelEpisode.isPending}
+                title="Stop generation"
+              >
+                <Square className="mr-2 h-3.5 w-3.5 fill-current" />
+                {cancelEpisode.isPending ? 'Stopping...' : 'Stop'}
+              </Button>
+            ) : null}
+            {transcriptEntries.length > 0 ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void rerunTts.mutateAsync(episode.id)}
+                disabled={rerunTts.isPending || isActive}
+                title="Regenerate audio from saved transcript"
+              >
+                <Volume2 className={cn('mr-2 h-4 w-4', rerunTts.isPending && 'animate-pulse')} />
+                {rerunTts.isPending ? 'Starting TTS...' : 'Rerun TTS'}
+              </Button>
+            ) : null}
+            <Dialog
+              open={detailsOpen}
+              onOpenChange={(open) => {
+                setDetailsOpen(open)
+                if (!open) {
+                  setEditingTranscript(false)
+                }
+              }}
+            >
               <DialogTrigger asChild>
                 <Button variant="outline" size="sm">
                   <InfoIcon className="mr-2 h-4 w-4" /> {t('podcasts.details')}
@@ -376,18 +502,247 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
                       </ScrollArea>
                     </TabsContent>
 
-                    <TabsContent value="transcript" className="flex-1 overflow-hidden">
-                      <ScrollArea className="h-full pr-4 space-y-3">
-                        {transcriptEntries.length > 0 ? (
-                          transcriptEntries.map((entry, index) => (
-                            <div key={index} className="rounded border bg-muted/20 p-3 text-xs space-y-1">
-                              <p className="font-semibold text-foreground">{entry.speaker ?? t('podcasts.speaker')}</p>
-                              <p className="text-muted-foreground whitespace-pre-wrap">{entry.dialogue ?? ''}</p>
-                            </div>
-                          ))
-                        ) : (
-                          <p className="text-xs text-muted-foreground">{t('podcasts.noTranscript')}</p>
-                        )}
+                    <TabsContent value="transcript" className="flex-1 min-h-0 overflow-hidden data-[state=active]:flex data-[state=active]:flex-col gap-2">
+                      {transcriptEntries.length > 0 ? (
+                        <div className="flex shrink-0 items-center justify-end gap-2 pt-1">
+                          {editingTranscript ? (
+                            <>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                onClick={cancelEditTranscript}
+                                disabled={updateTranscript.isPending}
+                              >
+                                <X className="mr-1.5 h-3.5 w-3.5" /> Cancel
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                onClick={() => void saveEditTranscript()}
+                                disabled={updateTranscript.isPending}
+                              >
+                                <Check className="mr-1.5 h-3.5 w-3.5" />
+                                {updateTranscript.isPending ? 'Saving...' : 'Save Transcript'}
+                              </Button>
+                            </>
+                          ) : (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={startEditTranscript}
+                            >
+                              <Pencil className="mr-1.5 h-3.5 w-3.5" /> Edit Transcript
+                            </Button>
+                          )}
+                        </div>
+                      ) : null}
+
+                      <ScrollArea className="flex-1 min-h-0 pr-4">
+                        <div className="space-y-3">
+                          {editingTranscript ? (
+                            <>
+                              {draftTranscript.map((entry, index) => {
+                                const options = Array.from(
+                                  new Set([...speakerNames, entry.speaker].filter(Boolean))
+                                )
+                                return (
+                                  <div key={index} className="rounded border bg-muted/20 p-3 text-xs space-y-2">
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                      <div className="flex items-center gap-2">
+                                        <span className="font-mono text-[10px] text-muted-foreground">#{index + 1}</span>
+                                        <select
+                                          aria-label={`Speaker line ${index + 1}`}
+                                          className="flex h-7 rounded-md border border-input bg-background px-2 text-xs font-semibold"
+                                          value={entry.speaker}
+                                          onChange={(e) => {
+                                            const val = e.target.value
+                                            setDraftTranscript((prev) =>
+                                              prev.map((item, i) => (i === index ? { ...item, speaker: val } : item))
+                                            )
+                                          }}
+                                        >
+                                          {options.map((name) => (
+                                            <option key={name} value={name}>
+                                              {name}
+                                            </option>
+                                          ))}
+                                        </select>
+                                      </div>
+                                      <div className="flex items-center gap-1.5">
+                                        <select
+                                          aria-label={`Speed line ${index + 1}`}
+                                          className="flex h-7 rounded-md border border-input bg-background px-1.5 text-[11px] font-mono"
+                                          value={entry.speed ?? ''}
+                                          onChange={(e) => {
+                                            const val = e.target.value ? Number(e.target.value) : undefined
+                                            setDraftTranscript((prev) =>
+                                              prev.map((item, i) => (i === index ? { ...item, speed: val } : item))
+                                            )
+                                            setBlockSpeeds((prev) => ({ ...prev, [index]: val }))
+                                          }}
+                                        >
+                                          <option value="">Speed: Voice</option>
+                                          {[0.75, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.3].map((s) => (
+                                            <option key={s} value={s}>{s.toFixed(2)}x</option>
+                                          ))}
+                                        </select>
+                                        <Button
+                                          type="button"
+                                          variant="outline"
+                                          size="sm"
+                                          className="h-7 px-2 text-[11px]"
+                                          disabled={loadingClipIndex === index}
+                                          onClick={() => void handlePreviewClip(index)}
+                                        >
+                                          {loadingClipIndex === index ? (
+                                            <Loader2 className="h-3 w-3 animate-spin" />
+                                          ) : (
+                                            <Play className="h-3 w-3" />
+                                          )}
+                                        </Button>
+                                        <Button
+                                          type="button"
+                                          variant="outline"
+                                          size="sm"
+                                          className="h-7 px-2 text-[11px]"
+                                          disabled={rerunningClipIndex === index || isActive}
+                                          onClick={() =>
+                                            void handleRerunClip(index, {
+                                              speaker: entry.speaker,
+                                              dialogue: entry.dialogue,
+                                              speed: entry.speed,
+                                            })
+                                          }
+                                        >
+                                          {rerunningClipIndex === index ? (
+                                            <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                          ) : (
+                                            <RefreshCcw className="mr-1 h-3 w-3" />
+                                          )}
+                                          Rerun
+                                        </Button>
+                                        <Button
+                                          type="button"
+                                          variant="ghost"
+                                          size="icon"
+                                          className="h-7 w-7 text-destructive"
+                                          disabled={draftTranscript.length <= 1}
+                                          onClick={() =>
+                                            setDraftTranscript((prev) => prev.filter((_, i) => i !== index))
+                                          }
+                                          title="Remove line"
+                                        >
+                                          <Trash2 className="h-3.5 w-3.5" />
+                                        </Button>
+                                      </div>
+                                    </div>
+                                    <Textarea
+                                      rows={3}
+                                      className="text-xs"
+                                      value={entry.dialogue}
+                                      onChange={(e) => {
+                                        const val = e.target.value
+                                        setDraftTranscript((prev) =>
+                                          prev.map((item, i) => (i === index ? { ...item, dialogue: val } : item))
+                                        )
+                                      }}
+                                    />
+                                    {clipUrls[index] ? (
+                                      <audio controls autoPlay src={clipUrls[index]} className="w-full h-8" />
+                                    ) : null}
+                                  </div>
+                                )
+                              })}
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="w-full"
+                                onClick={() =>
+                                  setDraftTranscript((prev) => [
+                                    ...prev,
+                                    {
+                                      speaker: speakerNames[0] ?? prev[prev.length - 1]?.speaker ?? '',
+                                      dialogue: '',
+                                    },
+                                  ])
+                                }
+                              >
+                                <Plus className="mr-1.5 h-3.5 w-3.5" /> Add Line
+                              </Button>
+                            </>
+                          ) : transcriptEntries.length > 0 ? (
+                            transcriptEntries.map((entry, index) => {
+                              const currentSpeed = blockSpeeds[index] ?? entry.speed
+                              return (
+                                <div key={index} className="rounded border bg-muted/20 p-3 text-xs space-y-2">
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <p className="font-semibold text-foreground">
+                                      <span className="mr-1.5 font-mono text-[10px] text-muted-foreground">#{index + 1}</span>
+                                      {entry.speaker ?? t('podcasts.speaker')}
+                                    </p>
+                                    <div className="flex items-center gap-1.5">
+                                      <select
+                                        aria-label={`Speed block ${index + 1}`}
+                                        className="flex h-7 rounded-md border border-input bg-background px-1.5 text-[11px] font-mono"
+                                        value={currentSpeed ?? ''}
+                                        onChange={(e) => {
+                                          const val = e.target.value ? Number(e.target.value) : undefined
+                                          setBlockSpeeds((prev) => ({ ...prev, [index]: val }))
+                                        }}
+                                      >
+                                        <option value="">Speed: Voice</option>
+                                        {[0.75, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.3].map((s) => (
+                                          <option key={s} value={s}>{s.toFixed(2)}x</option>
+                                        ))}
+                                      </select>
+                                      <Button
+                                        type="button"
+                                        variant="outline"
+                                        size="sm"
+                                        className="h-7 px-2 text-[11px]"
+                                        disabled={loadingClipIndex === index}
+                                        onClick={() => void handlePreviewClip(index)}
+                                        title="Preview this block"
+                                      >
+                                        {loadingClipIndex === index ? (
+                                          <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                        ) : (
+                                          <Play className="mr-1 h-3 w-3" />
+                                        )}
+                                        Preview
+                                      </Button>
+                                      <Button
+                                        type="button"
+                                        variant="outline"
+                                        size="sm"
+                                        className="h-7 px-2 text-[11px]"
+                                        disabled={rerunningClipIndex === index || isActive}
+                                        onClick={() => void handleRerunClip(index)}
+                                        title="Rerun TTS for this block and re-mux"
+                                      >
+                                        {rerunningClipIndex === index ? (
+                                          <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                        ) : (
+                                          <RefreshCcw className="mr-1 h-3 w-3" />
+                                        )}
+                                        {rerunningClipIndex === index ? 'Rerunning...' : 'Rerun'}
+                                      </Button>
+                                    </div>
+                                  </div>
+                                  <p className="text-muted-foreground whitespace-pre-wrap">{entry.dialogue ?? ''}</p>
+                                  {clipUrls[index] ? (
+                                    <audio controls autoPlay src={clipUrls[index]} className="w-full h-8" />
+                                  ) : null}
+                                </div>
+                              )
+                            })
+                          ) : (
+                            <p className="text-xs text-muted-foreground">{t('podcasts.noTranscript')}</p>
+                          )}
+                        </div>
                       </ScrollArea>
                     </TabsContent>
                   </Tabs>

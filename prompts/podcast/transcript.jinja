@@ -96,6 +96,8 @@ The line below is a {% if speakers|length == 1 %}one-entry{% else %}two-entry{% 
 {%- endif %}
    - Never emit placeholder or elided content: no "..." or "…", no "[like this]", no "<like this>", no "TODO", no empty strings, no trailing commas.
    - Never shorten or truncate the list. Write out every entry in full.
+   - Write each speaker's dialogue using the exact dialect, regional phonetic spellings, contractions, dropped g's, and verbal tics specified in their Personality (e.g. "cah" for car, "pahk" for park, "nothin'", "gonna", "wudder") so the TTS engine pronounces their accent naturally.
+   - NEVER write words in ALL CAPS for shouting or emphasis (never "SHUT UP", "LISTEN HERE", "KILLIN'") because TTS engines read all-caps words letter-by-letter. Always use normal sentence casing with exclamation marks or punctuation instead.
 
 Formatting instructions:
 {{ format_instructions}}
