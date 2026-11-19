@@ -43,6 +43,44 @@ interface GeneratePodcastDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
+const SENTIMENT_PRESETS: Record<string, { label: string; prompt: string }> = {
+  default: { label: 'Default (Follow sources)', prompt: '' },
+  balanced: {
+    label: 'Balanced / Neutralize bias',
+    prompt:
+      'SENTIMENT & BALANCE: Maintain strict neutrality and balance. If the source material leans strongly one-sided or partisan, actively steelman and present the strongest counter-arguments and opposing perspectives so both sides receive fair, substantive weight.',
+  },
+  counter: {
+    label: "Counter-narrative / Devil's advocate",
+    prompt:
+      "SENTIMENT & ANGLE: Challenge the prevailing framing of the sources. Push back against the dominant viewpoint, highlight blind spots or missing context, and argue the strongest counter-perspective even when the sources lean the other way.",
+  },
+  supportive: {
+    label: 'Supportive / Steelman sources',
+    prompt:
+      'SENTIMENT & ANGLE: Take a charitable, supportive framing of the core thesis in the sources while grounding every point in accurate facts.',
+  },
+}
+
+const STYLE_PRESETS: Record<string, { label: string; prompt: string }> = {
+  default: { label: 'Profile default', prompt: '' },
+  satirical: {
+    label: 'Satirical / Sharp wit',
+    prompt:
+      'STYLE & TONE: Deliver the episode in a sharp, satirical style. Use dry irony, deadpan sarcasm, and playful exaggeration to roast the absurdity, spin, and contradictions in the material while keeping the underlying facts accurate.',
+  },
+  investigative: {
+    label: 'Skeptical / Investigative',
+    prompt:
+      'STYLE & TONE: Adopt a skeptical, investigative tone. Question motives, follow the incentives, and scrutinize claims rather than taking PR or framing at face value.',
+  },
+  conversational: {
+    label: 'Light & conversational',
+    prompt:
+      'STYLE & TONE: Keep the tone relaxed, accessible, and conversational—focus on clear takeaways without heavy drama.',
+  },
+}
+
 export function GeneratePodcastDialog({ open, onOpenChange }: GeneratePodcastDialogProps) {
   const { t } = useTranslation()
   const { toast } = useToast()
@@ -50,6 +88,8 @@ export function GeneratePodcastDialog({ open, onOpenChange }: GeneratePodcastDia
   const [selections, setSelections] = useState<Record<string, NotebookSelection>>({})
   const [episodeProfileId, setEpisodeProfileId] = useState<string>('')
   const [episodeName, setEpisodeName] = useState('')
+  const [sentimentPreset, setSentimentPreset] = useState<string>('default')
+  const [stylePreset, setStylePreset] = useState<string>('default')
   const [instructions, setInstructions] = useState('')
 
   const [isBuildingContext, setIsBuildingContext] = useState(false)
@@ -190,6 +230,8 @@ export function GeneratePodcastDialog({ open, onOpenChange }: GeneratePodcastDia
     setSelections({})
     setEpisodeProfileId('')
     setEpisodeName('')
+    setSentimentPreset('default')
+    setStylePreset('default')
     setInstructions('')
     setTokenCount(0)
     setCharCount(0)
@@ -428,12 +470,18 @@ export function GeneratePodcastDialog({ open, onOpenChange }: GeneratePodcastDia
         return
       }
 
+      const suffixParts = [
+        SENTIMENT_PRESETS[sentimentPreset]?.prompt,
+        STYLE_PRESETS[stylePreset]?.prompt,
+        instructions.trim(),
+      ].filter((part): part is string => Boolean(part))
+
       const payload: PodcastGenerationRequest = {
         episode_profile: selectedEpisodeProfile.name,
         speaker_profile: speakerProfileRef,
         episode_name: episodeName.trim(),
         content,
-        briefing_suffix: instructions.trim() ? instructions.trim() : undefined,
+        briefing_suffix: suffixParts.length > 0 ? suffixParts.join('\n\n') : undefined,
       }
 
       // mutateAsync resolves only after the mutation's onSuccess handler has
@@ -462,6 +510,8 @@ export function GeneratePodcastDialog({ open, onOpenChange }: GeneratePodcastDia
     episodeName,
     generatePodcast,
     instructions,
+    sentimentPreset,
+    stylePreset,
     onOpenChange,
     resetState,
     selectedEpisodeProfile,
@@ -561,6 +611,39 @@ export function GeneratePodcastDialog({ open, onOpenChange }: GeneratePodcastDia
                       placeholder={t('podcasts.episodeNamePlaceholder')}
                       autoComplete="off"
                     />
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label htmlFor="sentiment_preset">Perspective / Sentiment</Label>
+                      <select
+                        id="sentiment_preset"
+                        className="flex h-9 w-full rounded-md border border-input bg-background px-2.5 text-xs"
+                        value={sentimentPreset}
+                        onChange={(event) => setSentimentPreset(event.target.value)}
+                      >
+                        {Object.entries(SENTIMENT_PRESETS).map(([key, preset]) => (
+                          <option key={key} value={key}>
+                            {preset.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="style_preset">Tone / Style</Label>
+                      <select
+                        id="style_preset"
+                        className="flex h-9 w-full rounded-md border border-input bg-background px-2.5 text-xs"
+                        value={stylePreset}
+                        onChange={(event) => setStylePreset(event.target.value)}
+                      >
+                        {Object.entries(STYLE_PRESETS).map(([key, preset]) => (
+                          <option key={key} value={key}>
+                            {preset.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
 
                    <div className="space-y-2">

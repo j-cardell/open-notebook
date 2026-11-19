@@ -1,0 +1,2 @@
+-- Migration 27 rollback: Remove progress field from episode.
+REMOVE FIELD IF EXISTS progress ON TABLE episode;

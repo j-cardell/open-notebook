@@ -195,6 +195,30 @@ export function useRerunEpisodeTts() {
   })
 }
 
+export function useCleanupEpisodeClips() {
+  const queryClient = useQueryClient()
+  const { toast } = useToast()
+
+  return useMutation({
+    mutationFn: (episodeId: string) => podcastsApi.cleanupEpisodeClips(episodeId),
+    onSuccess: async (data) => {
+      await queryClient.refetchQueries({ queryKey: QUERY_KEYS.podcastEpisodes })
+      const freedMb = (data.freed_bytes / (1024 * 1024)).toFixed(1)
+      toast({
+        title: 'Clips cleaned up',
+        description: `Removed ${data.deleted_files} loose clip files (${freedMb} MB freed). Main audio kept.`,
+      })
+    },
+    onError: (error: unknown) => {
+      toast({
+        title: 'Failed to clean up clips',
+        description: error instanceof Error ? error.message : 'Unable to clean up clips',
+        variant: 'destructive',
+      })
+    },
+  })
+}
+
 export function useCancelPodcastEpisode() {
   const queryClient = useQueryClient()
   const { toast } = useToast()

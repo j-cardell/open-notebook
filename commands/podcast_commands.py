@@ -1,7 +1,7 @@
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from loguru import logger
 from surreal_commands import CommandInput, CommandOutput, command
@@ -372,14 +372,87 @@ async def generate_podcast_command(
         # 8. Generate podcast using podcast-creator
         logger.info("Starting podcast generation with podcast-creator...")
 
-        result = await create_podcast(
-            content=input_data.content,
-            briefing=briefing,
-            episode_name=episode_dir_name,
-            output_dir=str(output_dir),
-            speaker_config=speaker_profile.name,
-            episode_profile=episode_profile.name,
-        )
+        async def _save_progress(prog: Optional[Dict[str, Any]]) -> None:
+            episode.progress = prog
+            try:
+                await episode.save()
+            except Exception as err:
+                logger.warning(f"Failed saving progress for {episode.id}: {err}")
+
+        await _save_progress({"stage": "outline"})
+
+        import podcast_creator.graph as pc_graph_mod
+
+        real_graph = pc_graph_mod.graph
+
+        class _StreamingGraphProxy:
+            """Streams node updates so outline/transcript persist before TTS finishes."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            async def ainvoke(self, state, config=None, **kwargs):
+                final_state = dict(state) if isinstance(state, dict) else {}
+                async for event in self._inner.astream(
+                    state, config=config, stream_mode="updates", **kwargs
+                ):
+                    if not isinstance(event, dict):
+                        continue
+                    for node_name, node_update in event.items():
+                        if not isinstance(node_update, dict):
+                            continue
+                        final_state.update(node_update)
+                        changed = False
+                        if "outline" in node_update and node_update["outline"] is not None:
+                            episode.outline = full_model_dump(node_update["outline"])
+                            episode.progress = {"stage": "transcript"}
+                            changed = True
+                        if "transcript" in node_update and node_update["transcript"] is not None:
+                            episode.transcript = {
+                                "transcript": full_model_dump(node_update["transcript"])
+                            }
+                            entries = episode.transcript.get("transcript") or []
+                            total_clips = sum(
+                                1 for e in entries if str((e or {}).get("dialogue", "")).strip()
+                            )
+                            episode.progress = {
+                                "stage": "audio",
+                                "completed_clips": 0,
+                                "total_clips": total_clips,
+                                "clips_dir": str(output_dir / "clips"),
+                            }
+                            changed = True
+                        if node_name == "generate_all_audio":
+                            cur = dict(episode.progress or {})
+                            total_clips = cur.get("total_clips") or len(
+                                node_update.get("audio_clips") or []
+                            )
+                            episode.progress = {
+                                "stage": "combining",
+                                "completed_clips": total_clips,
+                                "total_clips": total_clips,
+                            }
+                            changed = True
+                        if changed:
+                            await _save_progress(episode.progress)
+                return final_state
+
+        pc_graph_mod.graph = _StreamingGraphProxy(real_graph)
+        try:
+            result = await create_podcast(
+                content=input_data.content,
+                briefing=briefing,
+                episode_name=episode_dir_name,
+                output_dir=str(output_dir),
+                speaker_config=speaker_profile.name,
+                episode_profile=episode_profile.name,
+            )
+        finally:
+            pc_graph_mod.graph = real_graph
+            episode.progress = None
 
         # podcast-creator reports audio-combination failures IN-BAND: on
         # ffmpeg/clip errors combine_audio_files() returns an "ERROR: ..."
@@ -549,6 +622,17 @@ async def rerun_podcast_tts_command(
         tts_model = pc_speaker_profile.tts_model
         tts_config = pc_speaker_profile.tts_config or {}
         non_empty_raw = [e for e in raw_entries if str(e.get("dialogue", "")).strip()]
+        total_clips = len(dialogue_list)
+        episode.progress = {
+            "stage": "audio",
+            "completed_clips": 0,
+            "total_clips": total_clips,
+            "clips_dir": str(output_dir / "clips"),
+        }
+        try:
+            await episode.save()
+        except Exception:
+            pass
         for i, dlg in enumerate(dialogue_list):
             if await _is_command_cancelled(input_data):
                 raise RuntimeError("Stopped by user")
@@ -590,9 +674,29 @@ async def rerun_podcast_tts_command(
                     }
                 )
             all_clip_paths.append(clip_path)
+            episode.progress = {
+                "stage": "audio",
+                "completed_clips": i + 1,
+                "total_clips": total_clips,
+                "clips_dir": str(output_dir / "clips"),
+            }
+            try:
+                await episode.save()
+            except Exception:
+                pass
 
         if await _is_command_cancelled(input_data):
             raise RuntimeError("Stopped by user")
+
+        episode.progress = {
+            "stage": "combining",
+            "completed_clips": total_clips,
+            "total_clips": total_clips,
+        }
+        try:
+            await episode.save()
+        except Exception:
+            pass
 
         state["audio_clips"] = all_clip_paths
         final_res = await combine_audio_node(state, {})
@@ -604,6 +708,7 @@ async def rerun_podcast_tts_command(
         audio_file_rel = to_relative_audio_path(str(raw_audio_path))
         old_audio_file = episode.audio_file
         episode.audio_file = audio_file_rel
+        episode.progress = None
         await episode.save()
 
         if old_audio_file and old_audio_file != audio_file_rel:
@@ -625,6 +730,11 @@ async def rerun_podcast_tts_command(
             processing_time=processing_time,
         )
     except Exception as e:
+        episode.progress = None
+        try:
+            await episode.save()
+        except Exception:
+            pass
         logger.error(f"TTS regeneration failed for {input_data.episode_id}: {e}")
         logger.exception(e)
         raise RuntimeError(str(e)) from e

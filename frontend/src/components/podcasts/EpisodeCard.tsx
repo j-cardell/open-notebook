@@ -7,7 +7,7 @@ import { Check, InfoIcon, Loader2, Pencil, Play, Plus, RefreshCcw, Square, Trash
 
 import apiClient from '@/lib/api/client'
 import { resolvePodcastAssetUrl } from '@/lib/api/podcasts'
-import { useCancelPodcastEpisode, useRerunEpisodeClip, useRerunEpisodeTts, useUpdateEpisodeTranscript } from '@/lib/hooks/use-podcasts'
+import { useCancelPodcastEpisode, useCleanupEpisodeClips, useRerunEpisodeClip, useRerunEpisodeTts, useUpdateEpisodeTranscript } from '@/lib/hooks/use-podcasts'
 import { ACTIVE_EPISODE_STATUSES, EpisodeStatus, FAILED_EPISODE_STATUSES, PodcastEpisode } from '@/lib/types/podcasts'
 import { cn } from '@/lib/utils'
 import {
@@ -173,9 +173,14 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
   const rerunTts = useRerunEpisodeTts()
   const rerunClip = useRerunEpisodeClip()
   const cancelEpisode = useCancelPodcastEpisode()
+  const cleanupClips = useCleanupEpisodeClips()
 
   const outlineSegments = useMemo(() => extractOutlineSegments(episode.outline), [episode.outline])
   const transcriptEntries = useMemo(() => extractTranscriptEntries(episode.transcript), [episode.transcript])
+  const completedClipSet = useMemo(
+    () => new Set(episode.progress?.completed_clip_indices ?? []),
+    [episode.progress?.completed_clip_indices]
+  )
 
   const speakerNames = useMemo(() => {
     const names = (episode.speaker_profile?.speakers ?? []).map((s) => s.name).filter(Boolean)
@@ -317,6 +322,18 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
   const isFailed = FAILED_EPISODE_STATUSES.includes(episode.job_status as EpisodeStatus)
   const isActive = ACTIVE_EPISODE_STATUSES.includes(episode.job_status as EpisodeStatus)
 
+  const progressLabel = useMemo(() => {
+    if (!isActive || !episode.progress) return null
+    const { stage, completed_clips, total_clips } = episode.progress
+    if (stage === 'audio' && typeof total_clips === 'number' && total_clips > 0) {
+      return `${completed_clips ?? 0} of ${total_clips} complete`
+    }
+    if (stage === 'combining') return 'Combining audio...'
+    if (stage === 'transcript') return 'Writing transcript...'
+    if (stage === 'outline') return 'Writing outline...'
+    return null
+  }, [isActive, episode.progress])
+
   return (
     <Card>
       <CardContent className="space-y-4 p-4">
@@ -327,6 +344,11 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
                 {episode.name}
               </h3>
               <StatusBadge status={episode.job_status} />
+              {progressLabel ? (
+                <span className="text-xs font-medium text-muted-foreground">
+                  {progressLabel}
+                </span>
+              ) : null}
             </div>
             <p className="text-xs text-muted-foreground">
               {t('podcasts.profile')}: {episode.episode_profile?.name || t('common.unknown')}
@@ -345,6 +367,18 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
               >
                 <Square className="mr-2 h-3.5 w-3.5 fill-current" />
                 {cancelEpisode.isPending ? 'Stopping...' : 'Stop'}
+              </Button>
+            ) : null}
+            {!isActive && episode.has_clips ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void cleanupClips.mutateAsync(episode.id)}
+                disabled={cleanupClips.isPending}
+                title="Delete loose per-block clip files and keep only the main episode audio"
+              >
+                <Trash2 className="mr-2 h-3.5 w-3.5" />
+                {cleanupClips.isPending ? 'Cleaning...' : 'Clean Clips'}
               </Button>
             ) : null}
             {transcriptEntries.length > 0 ? (
@@ -650,7 +684,7 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
                                       }}
                                     />
                                     {clipUrls[index] ? (
-                                      <audio controls autoPlay src={clipUrls[index]} className="w-full h-8" />
+                                      <audio controls src={clipUrls[index]} className="w-full h-8" />
                                     ) : null}
                                   </div>
                                 )
@@ -676,12 +710,25 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
                           ) : transcriptEntries.length > 0 ? (
                             transcriptEntries.map((entry, index) => {
                               const currentSpeed = blockSpeeds[index] ?? entry.speed
+                              const isAudioStage = episode.progress?.stage === 'audio'
+                              const clipReady = !isActive || (isAudioStage && completedClipSet.has(index))
                               return (
                                 <div key={index} className="rounded border bg-muted/20 p-3 text-xs space-y-2">
                                   <div className="flex flex-wrap items-center justify-between gap-2">
                                     <p className="font-semibold text-foreground">
                                       <span className="mr-1.5 font-mono text-[10px] text-muted-foreground">#{index + 1}</span>
                                       {entry.speaker ?? t('podcasts.speaker')}
+                                      {isActive && isAudioStage ? (
+                                        clipReady ? (
+                                          <Badge variant="secondary" className="ml-2 text-[10px] py-0 px-1.5">
+                                            Ready
+                                          </Badge>
+                                        ) : (
+                                          <span className="ml-2 text-[10px] font-normal text-muted-foreground">
+                                            Pending
+                                          </span>
+                                        )
+                                      ) : null}
                                     </p>
                                     <div className="flex items-center gap-1.5">
                                       <select
@@ -703,9 +750,9 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
                                         variant="outline"
                                         size="sm"
                                         className="h-7 px-2 text-[11px]"
-                                        disabled={loadingClipIndex === index}
+                                        disabled={loadingClipIndex === index || !clipReady}
                                         onClick={() => void handlePreviewClip(index)}
-                                        title="Preview this block"
+                                        title={clipReady ? 'Preview this block' : 'Waiting for clip generation'}
                                       >
                                         {loadingClipIndex === index ? (
                                           <Loader2 className="mr-1 h-3 w-3 animate-spin" />
@@ -734,7 +781,7 @@ export function EpisodeCard({ episode, onDelete, deleting, onRetry, retrying }: 
                                   </div>
                                   <p className="text-muted-foreground whitespace-pre-wrap">{entry.dialogue ?? ''}</p>
                                   {clipUrls[index] ? (
-                                    <audio controls autoPlay src={clipUrls[index]} className="w-full h-8" />
+                                    <audio controls src={clipUrls[index]} className="w-full h-8" />
                                   ) : null}
                                 </div>
                               )

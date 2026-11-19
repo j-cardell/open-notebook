@@ -88,6 +88,15 @@ export const podcastsApi = {
     return response.data
   },
 
+  cleanupEpisodeClips: async (episodeId: string) => {
+    const response = await apiClient.delete<{
+      episode_id: string
+      deleted_files: number
+      freed_bytes: number
+    }>(`/podcasts/episodes/${episodeId}/clips`)
+    return response.data
+  },
+
   listEpisodeProfiles: async () => {
     const response = await apiClient.get<EpisodeProfile[]>('/episode-profiles')
     return response.data

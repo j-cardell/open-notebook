@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import random
 import re
 import signal
 import socket
@@ -23,6 +24,39 @@ import wave
 HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PROXY_PORT", "8083"))
 UPSTREAM = os.environ.get("TTS_UPSTREAM", "http://127.0.0.1:8082")
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "qwentts").strip().lower()
+HIGGS_URL = os.environ.get("HIGGS_URL", "http://host.docker.internal:8084").rstrip("/")
+HIGGS_MODEL = os.environ.get("HIGGS_MODEL", "bosonai/higgs-audio-v3-tts-4b")
+HIGGS_TEMPERATURE = float(os.environ.get("HIGGS_TEMPERATURE", "0.7"))
+HIGGS_TOP_P = float(os.environ.get("HIGGS_TOP_P", "0.95"))
+HIGGS_TOP_K = int(os.environ.get("HIGGS_TOP_K", "50"))
+S2PRO_URL = os.environ.get("S2PRO_URL", "http://host.docker.internal:8085").rstrip("/")
+S2PRO_MODEL = os.environ.get("S2PRO_MODEL", "fishaudio/s2-pro")
+QWEN3TTS_URL = os.environ.get("QWEN3TTS_URL", "http://host.docker.internal:8086").rstrip("/")
+QWEN3TTS_MODEL = os.environ.get("QWEN3TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+QWEN3TTS_TEMPERATURE = float(os.environ.get("QWEN3TTS_TEMPERATURE", "0.75"))
+QWEN3TTS_TOP_P = float(os.environ.get("QWEN3TTS_TOP_P", "0.92"))
+QWEN3TTS_TOP_K = int(os.environ.get("QWEN3TTS_TOP_K", "50"))
+
+
+def _is_omni_backend() -> bool:
+    return TTS_BACKEND in ("higgs", "s2pro", "qwen3tts")
+
+
+def _omni_url() -> str:
+    if TTS_BACKEND == "s2pro":
+        return S2PRO_URL
+    if TTS_BACKEND == "qwen3tts":
+        return QWEN3TTS_URL
+    return HIGGS_URL
+
+
+def _omni_model() -> str:
+    if TTS_BACKEND == "s2pro":
+        return S2PRO_MODEL
+    if TTS_BACKEND == "qwen3tts":
+        return QWEN3TTS_MODEL
+    return HIGGS_MODEL
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/app/models"))
 VOICES_DIR = Path(os.environ.get("VOICES_DIR", "/app/voices"))
 RVC_DIR = Path(os.environ.get("RVC_MODELS_DIR", "/app/rvc_models"))
@@ -98,6 +132,8 @@ def _register_all_voices() -> None:
 
 def _ensure_tts_server() -> None:
     global _child
+    if _is_omni_backend():
+        return
     if _upstream_ready():
         return
     with _lock:
@@ -186,10 +222,10 @@ def _split_tts_chunks(text: str, max_chars: int = 300) -> list[str]:
 def _gap_ms_for_chunk(text: str) -> int:
     t = (text or "").rstrip()
     if t.endswith(("?", "!")):
-        return 140
+        return 160
     if t.endswith("."):
-        return 110
-    return 60
+        return 150
+    return 100
 
 
 def _is_chunk_glitchy(wav_bytes: bytes, text: str) -> tuple[bool, str]:
@@ -207,7 +243,7 @@ def _is_chunk_glitchy(wav_bytes: bytes, text: str) -> tuple[bool, str]:
         clean_len = len(re.sub(r"\s+", " ", (text or "").strip()))
         if clean_len >= 20:
             cps = clean_len / dur
-            if cps > 45.0 or cps < 4.0:
+            if cps > 28.0 or cps < 4.0:
                 return True, f"bad rate ({cps:.1f} cps)"
         rms_db = float(20.0 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-9))
         if rms_db < -45.0:
@@ -300,9 +336,8 @@ def _apply_wav_speed(wav_bytes: bytes, speed: float) -> bytes:
     return subprocess.run(cmd, input=wav_bytes, capture_output=True, check=True).stdout
 
 
-def _normalize_speech_tempo(wav_bytes: bytes, text: str, target_speed: float) -> tuple[bytes, float]:
-    """Trim leading/trailing silence and compute an adaptive atempo toward 15*target_speed chars/sec."""
-    trimmed = wav_bytes
+def _trim_silence(wav_bytes: bytes) -> bytes:
+    """Trim leading/trailing silence without altering speaker tempo or cadence."""
     try:
         with tempfile.TemporaryDirectory() as tmp:
             in_p = Path(tmp) / "in.wav"
@@ -316,32 +351,31 @@ def _normalize_speech_tempo(wav_bytes: bytes, text: str, target_speed: float) ->
                 ],
                 check=True,
             )
-            trimmed = out_p.read_bytes()
+            return out_p.read_bytes()
     except Exception:
-        trimmed = wav_bytes
+        return wav_bytes
 
-    clean_text = re.sub(r"\s+", " ", (text or "").strip())
-    if len(clean_text) < 25:
-        return trimmed, target_speed
 
+def _normalize_speech_tempo(wav_bytes: bytes, text: str, target_speed: float = 1.0) -> tuple[bytes, float]:
+    """Trim silence and gently nudge extreme speaking rates toward ~3.0 wps * target_speed."""
+    trimmed = _trim_silence(wav_bytes)
+    words = max(1, len((text or "").split()))
     try:
         with wave.open(io.BytesIO(trimmed), "rb") as wf:
-            rate = wf.getframerate()
-            frames = wf.getnframes()
-        dur = frames / float(rate) if rate > 0 else 0.0
+            sr = wf.getframerate()
+            dur = wf.getnframes() / float(sr) if sr else 0.0
     except Exception:
-        return trimmed, target_speed
-
-    if dur <= 0.2 or dur > 3600.0:
-        return trimmed, target_speed
-
-    actual_cps = len(clean_text) / dur
-    target_cps = 18.0 * target_speed
-    raw_tempo = target_cps / actual_cps
-    lo = max(0.75, target_speed * 0.80)
-    hi = min(1.45, target_speed * 1.35)
-    tempo = max(0.75, min(1.45, max(lo, min(hi, raw_tempo))))
-    return trimmed, round(tempo, 2)
+        dur = 0.0
+    if dur <= 0.1:
+        return trimmed, _clamp_speed(target_speed)
+    actual_wps = words / dur
+    # Only nudge if outside normal conversational range (2.6 - 3.3 wps)
+    if 2.6 <= actual_wps <= 3.3:
+        norm = 1.0
+    else:
+        norm = max(0.90, min(1.12, 3.0 / actual_wps))
+    eff_speed = norm * float(target_speed)
+    return trimmed, max(0.65, min(1.35, round(eff_speed, 2)))
 
 
 def _wav_to_mp3(wav_bytes: bytes, speed: float = 1.0) -> bytes:
@@ -404,6 +438,19 @@ def _synthesize_voice_wav_locked(body: dict, out_wav: Path, tag: str = "preview"
 
         if wav_b64:
             raw_wav.write_bytes(base64.b64decode(wav_b64))
+        elif _is_omni_backend() and not use_voice_design:
+            req = urllib.request.Request(
+                f"{_omni_url()}/v1/audio/speech",
+                data=json.dumps({
+                    "model": _omni_model(),
+                    "input": sample_text,
+                    "response_format": "wav",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                raw_wav.write_bytes(resp.read())
         else:
             # Temporarily stop tts-server if running so Vulkan VRAM is free for qwen-tts CLI
             with _lock:
@@ -503,9 +550,9 @@ def _bake_voice(body: dict) -> dict:
     out_meta = VOICES_DIR / f"{name}.json"
 
     sample_text = _synthesize_voice_wav(body, out_wav, tag=name, apply_speed=False)
-    # Gently normalize the baked reference WAV toward the target tempo so Qwen3-TTS clones a natural pace
-    trimmed, ref_tempo = _normalize_speech_tempo(out_wav.read_bytes(), sample_text, speed)
-    ref_tempo = max(0.65, min(1.35, ref_tempo))
+    # trimmed, ref_tempo = _normalize_speech_tempo(out_wav.read_bytes(), sample_text, speed)
+    # ref_tempo = max(0.65, min(1.35, ref_tempo))
+    trimmed, ref_tempo = _trim_silence(out_wav.read_bytes()), speed
     out_wav.write_bytes(_apply_wav_speed(trimmed, ref_tempo))
     out_txt.write_text(sample_text, encoding="utf-8")
     out_meta.write_text(json.dumps({"speed": speed}), encoding="utf-8")
@@ -576,6 +623,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(
                 200,
                 {
+                    "backend": TTS_BACKEND,
+                    "base_speakers": ["default"] if _is_omni_backend() else sorted(BASE_SPEAKERS),
                     "baked": baked,
                     "rvc_models": rvc_models,
                     "rvc_catalog": rvc_catalog,
@@ -586,27 +635,42 @@ class Handler(BaseHTTPRequestHandler):
         mb = re.fullmatch(r"/voices/base/([a-zA-Z0-9_-]+)/preview", path)
         if mb:
             spk = mb.group(1)
-            if spk not in BASE_SPEAKERS:
+            allowed = {"default"} if _is_omni_backend() else BASE_SPEAKERS
+            if spk not in allowed:
                 return self._send_json(404, {"error": f"Unknown base speaker: {spk}"})
             BASE_SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-            wav = BASE_SAMPLES_DIR / f"{spk}.wav"
+            wav = BASE_SAMPLES_DIR / (f"{TTS_BACKEND}_{spk}.wav" if _is_omni_backend() else f"{spk}.wav")
             if not wav.exists():
-                with _lock:
-                    _stop_tts_server()
-                subprocess.run(
-                    [
-                        QWEN_TTS_BIN,
-                        "--model", str(CUSTOM_MODEL),
-                        "--codec", str(CODEC_MODEL),
-                        "--device", TTS_DEVICE,
-                        "--speaker", spk,
-                        "--lang", "English",
-                        "-o", str(wav),
-                    ],
-                    input=BASE_PREVIEW_TEXT,
-                    text=True,
-                    check=True,
-                )
+                if _is_omni_backend():
+                    req = urllib.request.Request(
+                        f"{_omni_url()}/v1/audio/speech",
+                        data=json.dumps({
+                            "model": _omni_model(),
+                            "input": BASE_PREVIEW_TEXT,
+                            "response_format": "wav",
+                        }).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=300) as resp:
+                        wav.write_bytes(resp.read())
+                else:
+                    with _lock:
+                        _stop_tts_server()
+                    subprocess.run(
+                        [
+                            QWEN_TTS_BIN,
+                            "--model", str(CUSTOM_MODEL),
+                            "--codec", str(CODEC_MODEL),
+                            "--device", TTS_DEVICE,
+                            "--speaker", spk,
+                            "--lang", "English",
+                            "-o", str(wav),
+                        ],
+                        input=BASE_PREVIEW_TEXT,
+                        text=True,
+                        check=True,
+                    )
             raw = wav.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
@@ -630,7 +694,16 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/models":
-            return self._send_json(200, {"object": "list", "data": [{"id": "qwen3-tts", "object": "model", "owned_by": "local"}]})
+            model_id = (
+                "fish-s2-pro"
+                if TTS_BACKEND == "s2pro"
+                else (
+                    "higgs-audio-v3"
+                    if TTS_BACKEND == "higgs"
+                    else "qwen3-tts"
+                )
+            )
+            return self._send_json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "local"}]})
 
         self._send_json(404, {"error": "Not found"})
 
@@ -667,7 +740,8 @@ class Handler(BaseHTTPRequestHandler):
                     sample_text = _synthesize_voice_wav(body, preview_wav, tag="preview", apply_speed=False)
                     raw = preview_wav.read_bytes()
                     speed = _clamp_speed(body.get("speed"))
-                    raw, eff_speed = _normalize_speech_tempo(raw, sample_text, speed)
+                    # raw, eff_speed = _normalize_speech_tempo(raw, sample_text, speed)
+                    raw, eff_speed = _trim_silence(raw), speed
                     raw = _apply_wav_speed(raw, eff_speed)
                 self.send_response(200)
                 self.send_header("Content-Type", "audio/wav")
@@ -707,18 +781,65 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     _ensure_tts_server()
                     full_text = str(payload.get("input", ""))
-                    chunks = _split_tts_chunks(full_text, max_chars=300)
+                    max_chars = 300 if TTS_BACKEND == "qwen3tts" else (480 if _is_omni_backend() else 300)
+                    chunks = _split_tts_chunks(full_text, max_chars=max_chars)
                     if not chunks:
                         chunks = [full_text]
                     wav_parts: list[bytes] = []
                     ctype = "audio/wav"
-                    for chunk_text in chunks:
-                        chunk_payload = dict(payload)
-                        chunk_payload["input"] = chunk_text
+                    ref_b64: str | None = None
+                    ref_txt: str = DEFAULT_SAMPLE_TEXT
+                    if _is_omni_backend() and target_voice:
+                        voice_wav = VOICES_DIR / f"{target_voice}.wav"
+                        if voice_wav.exists():
+                            ref_b64 = base64.b64encode(voice_wav.read_bytes()).decode("ascii")
+                            txt_path = voice_wav.with_suffix(".txt")
+                            if txt_path.exists():
+                                ref_txt = txt_path.read_text(encoding="utf-8").strip()
+                    base_seed = sum(ord(ch) for ch in (target_voice or "default")) + 42
+                    for chunk_idx, chunk_text in enumerate(chunks):
+                        if _is_omni_backend():
+                            chunk_payload = {
+                                "model": _omni_model(),
+                                "input": chunk_text,
+                                "response_format": "wav",
+                            }
+                            if TTS_BACKEND == "higgs":
+                                chunk_payload["extra_params"] = {
+                                    "temperature": HIGGS_TEMPERATURE,
+                                    "top_p": HIGGS_TOP_P,
+                                    "top_k": HIGGS_TOP_K,
+                                }
+                            elif TTS_BACKEND == "qwen3tts":
+                                chunk_payload["language"] = "English"
+                                chunk_payload["extra_params"] = {
+                                    "temperature": QWEN3TTS_TEMPERATURE,
+                                    "top_p": QWEN3TTS_TOP_P,
+                                    "top_k": QWEN3TTS_TOP_K,
+                                }
+                            if ref_b64:
+                                if TTS_BACKEND == "qwen3tts":
+                                    chunk_payload["task_type"] = "Base"
+                                chunk_payload["ref_audio"] = f"data:audio/wav;base64,{ref_b64}"
+                                chunk_payload["ref_text"] = ref_txt
+                            speech_url = f"{_omni_url()}/v1/audio/speech"
+                        else:
+                            chunk_payload = dict(payload)
+                            chunk_payload["input"] = chunk_text
+                            speech_url = f"{UPSTREAM}/v1/audio/speech"
                         chunk_wav = b""
                         for attempt in range(2):
+                            if _is_omni_backend():
+                                if TTS_BACKEND == "qwen3tts":
+                                    chunk_payload["seed"] = random.randint(1, 2_147_483_647)
+                                else:
+                                    chunk_payload["seed"] = base_seed + chunk_idx * 17 + attempt
+                                if TTS_BACKEND == "higgs":
+                                    chunk_payload["extra_params"]["temperature"] = min(
+                                        1.0, HIGGS_TEMPERATURE + 0.15 * attempt
+                                    )
                             req = urllib.request.Request(
-                                f"{UPSTREAM}/v1/audio/speech",
+                                speech_url,
                                 data=json.dumps(chunk_payload).encode("utf-8"),
                                 headers={"Content-Type": "application/json"},
                                 method="POST",
@@ -733,15 +854,12 @@ class Handler(BaseHTTPRequestHandler):
                                 print(f"[tts_proxy] Retrying glitchy chunk ({reason}): {chunk_text[:60]}", flush=True)
                         wav_parts.append(chunk_wav)
 
-                    resp_body = _concat_wavs(wav_parts, chunks)
-                    resp_body, eff_speed = _normalize_speech_tempo(
-                        resp_body, full_text, speed
-                    )
+                    resp_body = _trim_silence(_concat_wavs(wav_parts, chunks))
                     if convert_mp3:
-                        resp_body = _wav_to_mp3(resp_body, speed=eff_speed)
+                        resp_body = _wav_to_mp3(resp_body, speed=speed)
                         ctype = "audio/mpeg"
-                    elif abs(eff_speed - 1.0) >= 0.01:
-                        resp_body = _apply_wav_speed(resp_body, eff_speed)
+                    elif abs(speed - 1.0) >= 0.01:
+                        resp_body = _apply_wav_speed(resp_body, speed)
                     self.send_response(200)
                     self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(len(resp_body)))

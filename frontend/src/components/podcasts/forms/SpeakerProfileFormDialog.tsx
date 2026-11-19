@@ -114,6 +114,9 @@ export function SpeakerProfileFormDialog({
   const [rebakeCatalog, setRebakeCatalog] = useState<Array<{ path: string; name: string; gender: string; pitch: string; energy: string; timbre?: string[]; accent?: string; description?: string }>>([])
   const [rebakeBakedSet, setRebakeBakedSet] = useState<Record<string, string>>({})
   const [rebakeVdAvailable, setRebakeVdAvailable] = useState(false)
+  const [rebakeBaseSpeakers, setRebakeBaseSpeakers] = useState<string[]>([
+    'ryan', 'serena', 'vivian', 'aiden', 'uncle_fu', 'ono_anna', 'sohee', 'eric', 'dylan',
+  ])
   const [rebakeBaseMode, setRebakeBaseMode] = useState<'custom' | 'design'>('custom')
   const [rebakeBaseSpeaker, setRebakeBaseSpeaker] = useState('ryan')
   const [rebakeInstruct, setRebakeInstruct] = useState('')
@@ -153,6 +156,12 @@ export function SpeakerProfileFormDialog({
         setRebakeRvcModels(data.rvc_models || [])
         setRebakeCatalog(data.rvc_catalog || [])
         setRebakeVdAvailable(Boolean(data.voice_design_available))
+        if (Array.isArray(data.base_speakers) && data.base_speakers.length > 0) {
+          setRebakeBaseSpeakers(data.base_speakers)
+          setRebakeBaseSpeaker((prev) =>
+            data.base_speakers.includes(prev) ? prev : data.base_speakers[0]
+          )
+        }
         const bakedMap: Record<string, string> = {}
         const speedMap: Record<string, number> = {}
         for (const b of data.baked || []) {
@@ -651,7 +660,7 @@ export function SpeakerProfileFormDialog({
                             value={rebakeBaseSpeaker}
                             onChange={(e) => setRebakeBaseSpeaker(e.target.value)}
                           >
-                            {['ryan', 'serena', 'vivian', 'aiden', 'uncle_fu', 'ono_anna', 'sohee', 'eric', 'dylan'].map((s) => (
+                            {rebakeBaseSpeakers.map((s) => (
                               <option key={s} value={s}>{s}</option>
                             ))}
                           </select>

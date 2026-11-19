@@ -1,0 +1,4 @@
+rvc_models/
+voices/
+__pycache__/
+*.pyc

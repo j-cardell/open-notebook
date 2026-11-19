@@ -52,6 +52,8 @@ export function VoicesTab() {
 
   const [name, setName] = useState('')
   const [rvcModel, setRvcModel] = useState('')
+  const [backend, setBackend] = useState<'higgs' | 'qwentts'>('qwentts')
+  const [baseSpeakers, setBaseSpeakers] = useState<string[]>(BASE_SPEAKERS)
   const [baseMode, setBaseMode] = useState<'custom' | 'design'>('custom')
   const [baseSpeaker, setBaseSpeaker] = useState('ryan')
   const [designInstruct, setDesignInstruct] = useState('')
@@ -84,6 +86,13 @@ export function VoicesTab() {
       const res = await fetch('/api/voices')
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
+      const nextBackend = data.backend === 'higgs' ? 'higgs' : 'qwentts'
+      const nextSpeakers: string[] = Array.isArray(data.base_speakers) && data.base_speakers.length > 0
+        ? data.base_speakers
+        : BASE_SPEAKERS
+      setBackend(nextBackend)
+      setBaseSpeakers(nextSpeakers)
+      setBaseSpeaker((prev) => (nextSpeakers.includes(prev) ? prev : nextSpeakers[0]))
       setBaked(data.baked || [])
       setRvcModels(data.rvc_models || [])
       setRvcCatalog(data.rvc_catalog || [])
@@ -341,10 +350,13 @@ export function VoicesTab() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Plus className="h-4 w-4" />
-              Bake Cloned Voice (Qwen3-TTS + RVC)
+              Bake Cloned Voice ({backend === 'higgs' ? 'Higgs Audio v3' : 'Qwen3-TTS'} + RVC)
+              <Badge variant="secondary" className="ml-auto text-xs font-normal">
+                {backend === 'higgs' ? 'Higgs Audio v3' : 'Qwen3-TTS'}
+              </Badge>
             </CardTitle>
             <CardDescription>
-              Pick an RVC voice from the library below (or upload your own .pth/.wav) to bake a consistent Qwen3-TTS voice clone.
+              Pick an RVC voice from the library below (or upload your own .pth/.wav) to bake a consistent {backend === 'higgs' ? 'Higgs Audio v3' : 'Qwen3-TTS'} voice clone.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -362,7 +374,7 @@ export function VoicesTab() {
               <div className="space-y-2 rounded-md border bg-muted/30 p-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    Base Qwen3-TTS Generator
+                    Base {backend === 'higgs' ? 'Higgs Audio v3' : 'Qwen3-TTS'} Generator
                   </Label>
                   <div className="flex gap-1">
                     <Button
@@ -380,7 +392,7 @@ export function VoicesTab() {
                       variant={baseMode === 'design' ? 'default' : 'outline'}
                       onClick={() => setBaseMode('design')}
                       disabled={Boolean(wavFile) || !voiceDesignAvailable}
-                      title={voiceDesignAvailable ? 'Use Qwen3-TTS VoiceDesign model' : 'VoiceDesign GGUF not found in models/'}
+                      title={voiceDesignAvailable ? 'Generate a base voice from a text description (VoiceDesign)' : 'VoiceDesign GGUF not found in models/'}
                     >
                       VoiceDesign (Describe)
                     </Button>
@@ -392,13 +404,13 @@ export function VoicesTab() {
                     <div className="grid gap-3 sm:grid-cols-2 items-center">
                       <select
                         id="base-speaker"
-                        aria-label="Base Qwen3-TTS Speaker"
+                        aria-label="Base TTS Speaker"
                         className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
                         value={baseSpeaker}
                         onChange={(e) => setBaseSpeaker(e.target.value)}
                         disabled={Boolean(wavFile)}
                       >
-                        {BASE_SPEAKERS.map((spk) => (
+                        {baseSpeakers.map((spk) => (
                           <option key={spk} value={spk}>
                             {spk}
                           </option>
@@ -588,7 +600,7 @@ export function VoicesTab() {
               </div>
 
               <div className="space-y-1.5">
-                <Label htmlFor="upload-wav">Optional Reference WAV (skips Qwen base step)</Label>
+                <Label htmlFor="upload-wav">Optional Reference WAV (skips {backend === 'higgs' ? 'Higgs' : 'Qwen'} base step)</Label>
                 <Input
                   id="upload-wav"
                   type="file"

@@ -1,3 +1,5 @@
+import shutil
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -14,7 +16,7 @@ from api.podcast_service import (
 from open_notebook.ai.models import Model
 from open_notebook.database.repository import ensure_record_id, repo_query
 from open_notebook.exceptions import OpenNotebookError
-from open_notebook.podcasts.audio_paths import resolve_contained_audio_path
+from open_notebook.podcasts.audio_paths import podcasts_root, resolve_contained_audio_path
 from open_notebook.podcasts.models import PodcastEpisode
 
 router = APIRouter()
@@ -87,25 +89,58 @@ async def _resolve_snapshot_models(
 
 
 def _delete_episode_audio(episode: PodcastEpisode, episode_id: str) -> None:
-    """Best-effort unlink of an episode's audio file, refusing invalid paths.
+    """Best-effort cleanup of an episode's directory/audio files, refusing invalid paths.
 
-    Shared by the delete and retry endpoints. Legacy/escaping audio_file
-    values (resolve_contained_audio_path -> None) are logged and skipped.
+    Shared by the delete and retry endpoints. Removes the entire
+    ``episodes/<uuid>`` directory (main MP3, loose ``clips/``, JSON files)
+    when contained under ``podcasts_root()/episodes``; otherwise unlinks
+    only the main audio file.
     """
+    episodes_root = podcasts_root() / "episodes"
+    removed_dirs: set[Path] = set()
+
+    if episode.audio_file:
+        audio_path = resolve_contained_audio_path(episode.audio_file)
+        if audio_path is None:
+            logger.warning(
+                f"Refusing to delete audio file outside podcasts directory "
+                f"for episode {episode_id}: {episode.audio_file}"
+            )
+        else:
+            ep_dir = audio_path.parent.parent
+            if ep_dir.parent == episodes_root and ep_dir.is_dir():
+                try:
+                    shutil.rmtree(ep_dir)
+                    removed_dirs.add(ep_dir)
+                    logger.info(f"Deleted episode directory: {ep_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete episode directory {ep_dir}: {e}")
+            elif audio_path.exists():
+                try:
+                    audio_path.unlink()
+                    logger.info(f"Deleted audio file: {audio_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete audio file {audio_path}: {e}")
+
+    clips_dir = (episode.progress or {}).get("clips_dir")
+    if clips_dir:
+        try:
+            ep_dir = Path(clips_dir).resolve().parent
+            if ep_dir.parent == episodes_root and ep_dir.is_dir() and ep_dir not in removed_dirs:
+                shutil.rmtree(ep_dir)
+                logger.info(f"Deleted failed/in-progress episode directory: {ep_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to delete clips directory for {episode_id}: {e}")
+
+
+def _episode_has_clips(episode: PodcastEpisode) -> bool:
     if not episode.audio_file:
-        return
+        return False
     audio_path = resolve_contained_audio_path(episode.audio_file)
     if audio_path is None:
-        logger.warning(
-            f"Refusing to delete audio file outside podcasts directory "
-            f"for episode {episode_id}: {episode.audio_file}"
-        )
-    elif audio_path.exists():
-        try:
-            audio_path.unlink()
-            logger.info(f"Deleted audio file: {audio_path}")
-        except Exception as e:
-            logger.warning(f"Failed to delete audio file {audio_path}: {e}")
+        return False
+    clips_dir = audio_path.parent.parent / "clips"
+    return clips_dir.is_dir() and any(clips_dir.glob("*.mp3"))
 
 
 class PodcastEpisodeResponse(BaseModel):
@@ -121,6 +156,32 @@ class PodcastEpisodeResponse(BaseModel):
     created: Optional[str] = None
     job_status: Optional[str] = None
     error_message: Optional[str] = None
+    progress: Optional[dict] = None
+    has_clips: bool = False
+
+
+def _resolve_episode_progress(episode: PodcastEpisode, job_status: Optional[str]) -> Optional[dict]:
+    if job_status not in ("running", "processing", "submitted", "queued"):
+        return None
+    if not episode.progress:
+        return None
+    prog = dict(episode.progress)
+    clips_dir = prog.pop("clips_dir", None)
+    if prog.get("stage") == "audio" and clips_dir:
+        try:
+            p = Path(clips_dir)
+            if p.is_dir():
+                completed_indices = sorted(
+                    int(f.stem) for f in p.glob("*.mp3") if f.stem.isdigit()
+                )
+                total = prog.get("total_clips")
+                prog["completed_clips"] = (
+                    min(len(completed_indices), total) if total else len(completed_indices)
+                )
+                prog["completed_clip_indices"] = completed_indices
+        except Exception:
+            pass
+    return prog
 
 
 @router.post("/podcasts/generate", response_model=PodcastGenerationResponse)
@@ -241,6 +302,8 @@ async def list_podcast_episodes():
                     created=str(episode.created) if episode.created else None,
                     job_status=job_status,
                     error_message=error_message,
+                    progress=_resolve_episode_progress(episode, job_status),
+                    has_clips=_episode_has_clips(episode),
                 )
             )
 
@@ -303,6 +366,8 @@ async def get_podcast_episode(episode_id: str):
             created=str(episode.created) if episode.created else None,
             job_status=job_status,
             error_message=error_message,
+            progress=_resolve_episode_progress(episode, job_status),
+            has_clips=_episode_has_clips(episode),
         )
 
     except HTTPException:
@@ -483,20 +548,88 @@ async def rerun_podcast_episode_tts(episode_id: str):
         raise HTTPException(status_code=500, detail="Failed to rerun TTS")
 
 
+class ShutdownRequest(BaseModel):
+    mode: str = "all"
+
+
+@router.post("/podcasts/system/shutdown")
+async def shutdown_system_containers(payload: ShutdownRequest):
+    """Stop GPU model services (and optionally the Open Notebook compose stack) via host arbiter."""
+    import asyncio
+    import urllib.request
+
+    endpoint = "/_arbiter/stop-gpu" if payload.mode == "gpu" else "/_arbiter/stop-all"
+    url = f"http://host.docker.internal:8086{endpoint}"
+
+    def _post() -> bytes:
+        req = urllib.request.Request(url, data=b"{}", method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read()
+
+    try:
+        await asyncio.to_thread(_post)
+        return {"ok": True, "mode": "gpu" if payload.mode == "gpu" else "all"}
+    except Exception as e:
+        logger.error(f"Failed to stop containers via arbiter: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to contact host arbiter: {e}")
+
+
+@router.delete("/podcasts/episodes/{episode_id}/clips")
+async def cleanup_podcast_episode_clips(episode_id: str):
+    """Delete loose per-block clip MP3s while keeping the main episode audio."""
+    episode = await PodcastService.get_episode(episode_id)
+    if not episode.audio_file:
+        raise HTTPException(status_code=404, detail="Episode has no audio file")
+    audio_path = resolve_contained_audio_path(episode.audio_file)
+    if audio_path is None:
+        raise HTTPException(status_code=403, detail="Access to file denied")
+    clips_dir = audio_path.parent.parent / "clips"
+    deleted_files = 0
+    freed_bytes = 0
+    if clips_dir.is_dir():
+        for f in clips_dir.iterdir():
+            if f.is_file():
+                deleted_files += 1
+                freed_bytes += f.stat().st_size
+        shutil.rmtree(clips_dir)
+        logger.info(
+            f"Cleaned up {deleted_files} clip files ({freed_bytes} bytes) for {episode_id}"
+        )
+    return {
+        "episode_id": str(episode.id),
+        "deleted_files": deleted_files,
+        "freed_bytes": freed_bytes,
+    }
+
+
 @router.get("/podcasts/episodes/{episode_id}/clips/{clip_index}")
 async def stream_podcast_episode_clip(episode_id: str, clip_index: int):
     """Stream an individual dialogue clip MP3 for an episode."""
     if clip_index < 0:
         raise HTTPException(status_code=400, detail="Invalid clip index")
     episode = await PodcastService.get_episode(episode_id)
-    if not episode.audio_file:
-        raise HTTPException(status_code=404, detail="Episode has no audio directory")
-    audio_path = resolve_contained_audio_path(episode.audio_file)
-    if audio_path is None:
-        raise HTTPException(status_code=403, detail="Access to file denied")
-    clip_path = audio_path.parent.parent / "clips" / f"{clip_index:04d}.mp3"
-    if not clip_path.exists():
-        raise HTTPException(status_code=404, detail="Clip file not found")
+    clip_path: Optional[Path] = None
+
+    clips_dir = (episode.progress or {}).get("clips_dir")
+    if clips_dir:
+        resolved_clips_dir = Path(clips_dir).resolve()
+        root = podcasts_root()
+        if not resolved_clips_dir.is_relative_to(root):
+            raise HTTPException(status_code=403, detail="Access to file denied")
+        candidate = resolved_clips_dir / f"{clip_index:04d}.mp3"
+        if candidate.exists():
+            clip_path = candidate
+
+    if clip_path is None:
+        if not episode.audio_file:
+            raise HTTPException(status_code=404, detail="Clip file not found")
+        audio_path = resolve_contained_audio_path(episode.audio_file)
+        if audio_path is None:
+            raise HTTPException(status_code=403, detail="Access to file denied")
+        clip_path = audio_path.parent.parent / "clips" / f"{clip_index:04d}.mp3"
+        if not clip_path.exists():
+            raise HTTPException(status_code=404, detail="Clip file not found")
+
     return FileResponse(
         clip_path,
         media_type="audio/mpeg",
