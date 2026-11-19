@@ -10,6 +10,12 @@ from open_notebook.utils.proxy import ensure_internal_no_proxy
 
 ensure_internal_no_proxy()
 
+# The job queue (surreal-commands) must use the same namespace and database
+# as Open Notebook, defaults included (#1466).
+from open_notebook.database.repository import apply_database_defaults
+
+apply_database_defaults()
+
 import asyncio
 import os
 from contextlib import asynccontextmanager
@@ -55,6 +61,7 @@ from open_notebook.database.async_migrate import AsyncMigrationManager
 from open_notebook.exceptions import (
     AuthenticationError,
     ConfigurationError,
+    ConflictError,
     ExternalServiceError,
     InvalidInputError,
     NetworkError,
@@ -63,7 +70,7 @@ from open_notebook.exceptions import (
     RateLimitError,
     UnsupportedTypeException,
 )
-from open_notebook.utils.encryption import get_secret_from_env
+from open_notebook.utils.encryption import DEFAULT_ENCRYPTION_KEY, get_secret_from_env
 
 
 def _parse_cors_origins(raw: str) -> list[str]:
@@ -225,11 +232,19 @@ async def lifespan(app: FastAPI):
     logger.info("Starting API initialization...")
 
     # Security check: Encryption key
-    if not get_secret_from_env("OPEN_NOTEBOOK_ENCRYPTION_KEY"):
+    encryption_key = get_secret_from_env("OPEN_NOTEBOOK_ENCRYPTION_KEY")
+    if not encryption_key:
         logger.warning(
             "OPEN_NOTEBOOK_ENCRYPTION_KEY not set. "
             "API key encryption will fail until this is configured. "
             "Set OPEN_NOTEBOOK_ENCRYPTION_KEY to any secret string."
+        )
+    elif encryption_key == DEFAULT_ENCRYPTION_KEY:
+        logger.warning(
+            "OPEN_NOTEBOOK_ENCRYPTION_KEY is using the public example value. "
+            "Generate a private key before storing provider credentials. "
+            "Changing the key makes existing stored credentials unreadable; "
+            "re-create provider configurations after changing it."
         )
 
     # Security check: Password. Auth is off without it, which is fine on your
@@ -365,6 +380,15 @@ async def not_found_error_handler(request: Request, exc: NotFoundError):
 async def invalid_input_error_handler(request: Request, exc: InvalidInputError):
     return JSONResponse(
         status_code=400,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
+    )
+
+
+@app.exception_handler(ConflictError)
+async def conflict_error_handler(request: Request, exc: ConflictError):
+    return JSONResponse(
+        status_code=409,
         content={"detail": str(exc)},
         headers=_cors_headers(request),
     )
