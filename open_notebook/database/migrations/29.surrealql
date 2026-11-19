@@ -1,0 +1,2 @@
+-- Migration 29: Add optional live generation progress object to episode.
+DEFINE FIELD IF NOT EXISTS progress ON TABLE episode FLEXIBLE TYPE option<object>;

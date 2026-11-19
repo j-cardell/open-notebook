@@ -47,6 +47,56 @@ export const podcastsApi = {
     return response.data
   },
 
+  updateEpisodeTranscript: async (
+    episodeId: string,
+    transcript: Array<{ speaker: string; dialogue: string; speed?: number }>
+  ) => {
+    const response = await apiClient.patch<{
+      episode_id: string
+      transcript: { transcript: Array<{ speaker: string; dialogue: string; speed?: number }> }
+    }>(`/podcasts/episodes/${episodeId}/transcript`, { transcript })
+    return response.data
+  },
+
+  rerunEpisodeClip: async (
+    episodeId: string,
+    clipIndex: number,
+    payload: { speaker?: string; dialogue?: string; speed?: number }
+  ) => {
+    const response = await apiClient.post<{
+      episode_id: string
+      clip_index: number
+      entry: { speaker: string; dialogue: string; speed?: number }
+    }>(`/podcasts/episodes/${episodeId}/clips/${clipIndex}/rerun`, payload)
+    return response.data
+  },
+
+  rerunEpisodeTts: async (episodeId: string) => {
+    const response = await apiClient.post<{
+      job_id: string
+      status: string
+      message: string
+    }>(`/podcasts/episodes/${episodeId}/rerun-tts`)
+    return response.data
+  },
+
+  cancelEpisode: async (episodeId: string) => {
+    const response = await apiClient.post<{
+      episode_id: string
+      cancelled: boolean
+    }>(`/podcasts/episodes/${episodeId}/cancel`)
+    return response.data
+  },
+
+  cleanupEpisodeClips: async (episodeId: string) => {
+    const response = await apiClient.delete<{
+      episode_id: string
+      deleted_files: number
+      freed_bytes: number
+    }>(`/podcasts/episodes/${episodeId}/clips`)
+    return response.data
+  },
+
   listEpisodeProfiles: async () => {
     const response = await apiClient.get<EpisodeProfile[]>('/episode-profiles')
     return response.data

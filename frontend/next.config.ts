@@ -22,6 +22,8 @@ const nextConfig: NextConfig = {
     // This allows larger files to be uploaded through the /api/* rewrite proxy to FastAPI.
     // The Add Source dialog checks against the same value before uploading.
     proxyClientMaxBodySize: `${PROXY_MAX_UPLOAD_MB}mb`,
+    // Allow long-running voice bake/preview requests (VoiceDesign + RVC)
+    proxyTimeout: 300000,
   } as NextConfig['experimental'],
 
   // API Rewrites: Proxy /api/* requests to FastAPI backend

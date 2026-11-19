@@ -5,8 +5,20 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 
 import { cn } from '@/lib/utils'
+import apiClient from '@/lib/api/client'
 import { Button } from '@/components/ui/button'
 import { useAuth } from '@/lib/hooks/use-auth'
+import { useToast } from '@/lib/hooks/use-toast'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { useSidebarStore } from '@/lib/stores/sidebar-store'
 import { useCreateDialogs } from '@/lib/hooks/use-create-dialogs'
 import {
@@ -40,6 +52,7 @@ import {
   Plus,
   Wrench,
   Command,
+  Power,
 } from 'lucide-react'
 
 const getNavigation = (t: TFunction) => [
@@ -91,6 +104,32 @@ export function AppSidebar() {
   const navigation = getNavigation(t)
   const pathname = usePathname()
   const { logout } = useAuth()
+  const { toast } = useToast()
+  const [shutdownOpen, setShutdownOpen] = useState(false)
+  const [shuttingDown, setShuttingDown] = useState(false)
+
+  const handleShutdown = async (mode: 'gpu' | 'all') => {
+    setShuttingDown(true)
+    try {
+      await apiClient.post('/podcasts/system/shutdown', { mode })
+      setShutdownOpen(false)
+      toast({
+        title: mode === 'gpu' ? 'GPU models stopped' : 'Stopping all containers',
+        description:
+          mode === 'gpu'
+            ? 'R9700 GPU models have been unloaded.'
+            : 'Open Notebook and GPU containers are stopping. Use the Open Notebook desktop icon to start again.',
+      })
+    } catch (error) {
+      toast({
+        title: 'Failed to stop containers',
+        description: error instanceof Error ? error.message : 'Unable to reach host arbiter',
+        variant: 'destructive',
+      })
+    } finally {
+      setShuttingDown(false)
+    }
+  }
   const { isCollapsed, toggleCollapse } = useSidebarStore()
   const { openSourceDialog, openNotebookDialog, openPodcastDialog } = useCreateDialogs()
 
@@ -368,6 +407,32 @@ export function AppSidebar() {
               <TooltipTrigger asChild>
                 <Button
                   variant="outline"
+                  className="w-full justify-center sidebar-menu-item text-destructive hover:text-destructive"
+                  onClick={() => setShutdownOpen(true)}
+                  aria-label="Stop Containers"
+                >
+                  <Power className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="right">Stop Containers</TooltipContent>
+            </Tooltip>
+          ) : (
+            <Button
+              variant="outline"
+              className="w-full justify-start gap-2 sidebar-menu-item text-destructive hover:text-destructive"
+              onClick={() => setShutdownOpen(true)}
+              aria-label="Stop Containers"
+            >
+              <Power className="h-4 w-4" />
+              Stop Containers
+            </Button>
+          )}
+
+          {isCollapsed ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="outline"
                   className="w-full justify-center sidebar-menu-item"
                   onClick={logout}
                   aria-label={t('common.signOut')}
@@ -390,6 +455,37 @@ export function AppSidebar() {
           )}
         </div>
       </div>
+
+      <AlertDialog open={shutdownOpen} onOpenChange={setShutdownOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Stop containers?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Unload the GPU model containers (Qwen3-TTS / Radiance) to free VRAM, or stop all Open Notebook containers too. Your Open Notebook desktop launcher will start them again next time.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="flex-col sm:flex-row gap-2">
+            <AlertDialogCancel disabled={shuttingDown}>Cancel</AlertDialogCancel>
+            <Button
+              variant="outline"
+              disabled={shuttingDown}
+              onClick={() => void handleShutdown('gpu')}
+            >
+              Stop GPU Only
+            </Button>
+            <AlertDialogAction
+              disabled={shuttingDown}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={(e) => {
+                e.preventDefault()
+                void handleShutdown('all')
+              }}
+            >
+              {shuttingDown ? 'Stopping...' : 'Stop All Containers'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </TooltipProvider>
   )
 }

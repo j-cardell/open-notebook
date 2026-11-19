@@ -54,6 +54,7 @@ from api.routers import (
     sources,
     speaker_profiles,
     transformations,
+    voices,
 )
 from api.routers import commands as commands_router
 from open_notebook.database.async_migrate import AsyncMigrationManager
@@ -483,6 +484,7 @@ app.include_router(credentials.router, prefix="/api", tags=["credentials"])
 app.include_router(providers.router, prefix="/api", tags=["providers"])
 app.include_router(capabilities.router, prefix="/api", tags=["capabilities"])
 app.include_router(languages.router, prefix="/api", tags=["languages"])
+app.include_router(voices.router, prefix="/api", tags=["voices"])
 
 
 @app.get("/")

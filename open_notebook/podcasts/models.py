@@ -254,6 +254,9 @@ class PodcastEpisode(ObjectModel):
     command: Optional[Union[str, RecordID]] = Field(
         default=None, description="Link to surreal-commands job"
     )
+    progress: Optional[Dict[str, Any]] = Field(
+        default=None, description="Live generation progress"
+    )
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

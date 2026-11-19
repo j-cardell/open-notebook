@@ -1,9 +1,10 @@
 'use client'
 
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Controller, useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
+import { Loader2, Send, Sparkles, Wand2 } from 'lucide-react'
 
 import { EpisodeProfile, SpeakerProfile } from '@/lib/types/podcasts'
 import {
@@ -113,11 +114,107 @@ export function EpisodeProfileFormDialog({
     register,
     handleSubmit,
     reset,
+    setValue,
     formState: { errors },
   } = useForm<EpisodeProfileFormValues>({
     resolver: zodResolver(episodeProfileSchema(t)),
     defaultValues: getDefaults(),
   })
+
+  // AI Episode Designer state
+  const [designerOpen, setDesignerOpen] = useState(false)
+  const [designMessages, setDesignMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([])
+  const [designInput, setDesignInput] = useState('')
+  const [designQuestions, setDesignQuestions] = useState<
+    Array<{ id: string; label: string; prompt: string; placeholder?: string }>
+  >([])
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({})
+  const [designReply, setDesignReply] = useState<string | null>(null)
+  const [designLoading, setDesignLoading] = useState(false)
+  const [designError, setDesignError] = useState<string | null>(null)
+  const [designDraft, setDesignDraft] = useState<{
+    name: string
+    description: string
+    num_segments: number
+    suggested_speaker_profile_id?: string | null
+    default_briefing: string
+  } | null>(null)
+
+  const toggleDesigner = () => {
+    setDesignerOpen((prev) => !prev)
+  }
+
+  const sendDesignTurn = async (finalize = false) => {
+    let composed = designInput.trim()
+    if (designQuestions.length > 0) {
+      const answeredLines = designQuestions
+        .map((q) => {
+          const ans = (questionAnswers[q.id] || '').trim()
+          return ans ? `${q.label}: ${ans}` : null
+        })
+        .filter(Boolean) as string[]
+      if (composed) answeredLines.push(`Extra notes: ${composed}`)
+      composed = answeredLines.join('\n')
+    }
+    if (!composed && !finalize) return
+
+    const nextMessages = composed
+      ? [...designMessages, { role: 'user' as const, content: composed }]
+      : designMessages
+    if (composed) {
+      setDesignMessages(nextMessages)
+      setDesignInput('')
+      setQuestionAnswers({})
+    }
+    setDesignLoading(true)
+    setDesignError(null)
+    try {
+      const res = await fetch('/api/episode-profiles/design', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: nextMessages, finalize }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      const cleanReply = typeof data.reply === 'string' ? data.reply.replace(/\*\*/g, '') : ''
+      if (cleanReply) {
+        setDesignReply(cleanReply)
+        setDesignMessages([...nextMessages, { role: 'assistant', content: cleanReply }])
+      }
+      if (Array.isArray(data.questions) && data.questions.length > 0 && data.status !== 'ready') {
+        setDesignQuestions(data.questions)
+      } else {
+        setDesignQuestions([])
+      }
+      if (data.status === 'ready' && data.draft) {
+        setDesignDraft(data.draft)
+        setDesignQuestions([])
+      }
+    } catch (err) {
+      setDesignError(err instanceof Error ? err.message : 'Design request failed')
+    } finally {
+      setDesignLoading(false)
+    }
+  }
+
+  const applyDraftToEpisode = () => {
+    if (!designDraft) return
+    setValue('name', designDraft.name, { shouldDirty: true, shouldValidate: true })
+    setValue('description', designDraft.description || '', { shouldDirty: true })
+    setValue('default_briefing', designDraft.default_briefing, { shouldDirty: true, shouldValidate: true })
+    if (designDraft.num_segments >= 3 && designDraft.num_segments <= 20) {
+      setValue('num_segments', designDraft.num_segments, { shouldDirty: true, shouldValidate: true })
+    }
+    if (
+      designDraft.suggested_speaker_profile_id &&
+      speakerProfiles.some((sp) => sp.id === designDraft.suggested_speaker_profile_id)
+    ) {
+      setValue('speaker_config', designDraft.suggested_speaker_profile_id, {
+        shouldDirty: true,
+        shouldValidate: true,
+      })
+    }
+  }
 
   useEffect(() => {
     if (!open) {
@@ -152,7 +249,7 @@ export function EpisodeProfileFormDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-4xl">
         <DialogHeader>
           <DialogTitle>
             {isEdit ? t('podcasts.editEpisodeProfile') : t('podcasts.createEpisodeProfile')}
@@ -170,6 +267,129 @@ export function EpisodeProfileFormDialog({
             </AlertDescription>
           </Alert>
         ) : null}
+
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-muted-foreground">
+              Want AI to help write the show format &amp; default briefing?
+            </span>
+            <Button
+              type="button"
+              variant={designerOpen ? 'secondary' : 'outline'}
+              size="sm"
+              onClick={toggleDesigner}
+            >
+              <Wand2 className="mr-1.5 h-3.5 w-3.5" />
+              {designerOpen ? 'Close Designer' : 'Design Episode with AI'}
+            </Button>
+          </div>
+
+          {designerOpen ? (
+            <div className="rounded-md border bg-muted/40 p-3 space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold flex items-center gap-1.5">
+                  <Sparkles className="h-3.5 w-3.5" />
+                  AI Episode Format &amp; Showrunner Designer
+                </p>
+              </div>
+
+              {designReply ? (
+                <div className="rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground whitespace-pre-wrap">
+                  {designReply}
+                </div>
+              ) : null}
+
+              {designQuestions.length > 0 ? (
+                <div className="space-y-2.5 rounded-md border bg-background/70 p-3">
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                    Quick Follow-Up Details (leave any blank to let AI improvise)
+                  </p>
+                  {designQuestions.map((q) => (
+                    <div key={q.id} className="space-y-1">
+                      <Label htmlFor={`edq-${q.id}`} className="text-xs font-medium">
+                        {q.label}
+                      </Label>
+                      <p className="text-[11px] text-muted-foreground">{q.prompt}</p>
+                      <Input
+                        id={`edq-${q.id}`}
+                        placeholder={q.placeholder || 'Type your answer...'}
+                        value={questionAnswers[q.id] || ''}
+                        onChange={(e) =>
+                          setQuestionAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))
+                        }
+                      />
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              <div className="space-y-2">
+                <Textarea
+                  rows={2}
+                  placeholder={
+                    designQuestions.length > 0
+                      ? 'Optional extra notes, recurring bits, or tweaks...'
+                      : 'Describe your podcast show concept (e.g. Two cynical 1920s gangsters breaking down modern AI & finance news)...'
+                  }
+                  value={designInput}
+                  onChange={(e) => setDesignInput(e.target.value)}
+                />
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  {designMessages.length > 0 ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      disabled={designLoading}
+                      onClick={() => void sendDesignTurn(true)}
+                    >
+                      Skip &amp; Generate Now
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={
+                      designLoading ||
+                      (!designInput.trim() && !Object.values(questionAnswers).some((v) => v.trim()))
+                    }
+                    onClick={() => void sendDesignTurn(false)}
+                  >
+                    {designLoading ? (
+                      <>
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        Thinking...
+                      </>
+                    ) : (
+                      <>
+                        <Send className="mr-1.5 h-3.5 w-3.5" />
+                        {designQuestions.length > 0 ? 'Submit Answers' : 'Continue'}
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+
+              {designError ? <p className="text-xs text-destructive">{designError}</p> : null}
+
+              {designDraft ? (
+                <div className="rounded border bg-background p-3 space-y-2 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-sm">{designDraft.name}</span>
+                    <Button type="button" size="sm" onClick={applyDraftToEpisode}>
+                      Apply to Episode Profile
+                    </Button>
+                  </div>
+                  <p><span className="font-medium">Segments:</span> {designDraft.num_segments}</p>
+                  {designDraft.description ? (
+                    <p><span className="font-medium">Description:</span> {designDraft.description}</p>
+                  ) : null}
+                  <p><span className="font-medium">Default Briefing:</span> {designDraft.default_briefing}</p>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
 
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-6 pt-2">
           <div className="grid gap-4 md:grid-cols-2">

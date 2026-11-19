@@ -68,6 +68,7 @@ Follow these format requirements strictly:
    - Stick to the segment, do not go further than what's requested. Other agents will do the rest of the podcast.
    - The transcript must have at least {{ turns }} dialogue segments from the speaker.
    - The speaker should present the content in an engaging, educational manner.
+   - Treat consecutive entries as ONE continuous monologue split into beats, NOT separate restarts. Vary how entries begin: start most entries directly with the subject, a concrete detail, a name, a quote, or an action—only use conversational openers ("And...", "So...", "Wait...", "Okay...", "Here's the thing...") occasionally, and never repeat the same kind of opener in consecutive entries.
 {% else %}
 Follow these format requirements strictly:
    - Use the actual speaker names ({{ speaker_names|join(', ') }}) to denote speakers.
@@ -96,6 +97,8 @@ The line below is a {% if speakers|length == 1 %}one-entry{% else %}two-entry{% 
 {%- endif %}
    - Never emit placeholder or elided content: no "..." or "…", no "[like this]", no "<like this>", no "TODO", no empty strings, no trailing commas.
    - Never shorten or truncate the list. Write out every entry in full.
+   - Write each speaker's dialogue using the exact dialect, regional phonetic spellings, contractions, dropped g's, and verbal tics specified in their Personality (e.g. "cah" for car, "pahk" for park, "nothin'", "gonna", "wudder") so the TTS engine pronounces their accent naturally.
+   - NEVER write words in ALL CAPS for shouting or emphasis (never "SHUT UP", "LISTEN HERE", "KILLIN'") because TTS engines read all-caps words letter-by-letter. Always use normal sentence casing with exclamation marks or punctuation instead.
 
 Formatting instructions:
 {{ format_instructions}}

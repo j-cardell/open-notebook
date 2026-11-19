@@ -75,6 +75,13 @@ export interface Language {
   name: string
 }
 
+export interface EpisodeProgress {
+  stage?: string
+  completed_clips?: number
+  total_clips?: number
+  completed_clip_indices?: number[]
+}
+
 export interface PodcastEpisode {
   id: string
   name: string
@@ -88,6 +95,8 @@ export interface PodcastEpisode {
   created?: string | null
   job_status?: EpisodeStatus | null
   error_message?: string | null
+  progress?: EpisodeProgress | null
+  has_clips?: boolean
 }
 
 export interface PodcastGenerationRequest {
